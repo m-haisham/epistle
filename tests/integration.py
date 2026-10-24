@@ -49,7 +49,25 @@ def events(account=None,kind=None):
 def main():
     request("/control","POST",{"events":[],"status":200,"revoked":False,"token_calls":0,"token_lifetime":3600,"strict_rotation":False,"expected_refresh":None,"issued_tokens":{},"refresh_history":[],"token_failures":0,"introspections":[],"refresh_expires_at":None},base=MOCK,auth=False)
     with tempfile.TemporaryDirectory(prefix="epistle-integration-") as data:
-        env={**os.environ,"API_KEY":KEY,"MASTER_KEY":"01"*32,"WEBHOOK_SECRET":SECRET,"WEBHOOK_URL":MOCK+"/webhook","PUBLIC_URL":BASE,"DATA_DIR":data,"BIND_ADDR":"127.0.0.1:18080","ALLOW_INSECURE_TEST_ENDPOINTS":"true","TOKEN_ENDPOINT_OVERRIDE":MOCK+"/token","GOOGLE_CLIENT_ID":"test","GOOGLE_CLIENT_SECRET":"test","RECONCILE_SECS":"1","WATCHDOG_SECS":"10","FILE_RETENTION_SECS":"12","DISK_RESERVE_BYTES":"0"}
+        env = {
+            **os.environ,
+            "EPISTLE_SERVER__API_KEY": KEY,
+            "EPISTLE_SERVER__PUBLIC_URL": BASE,
+            "EPISTLE_SERVER__BIND_ADDR": "127.0.0.1:18080",
+            "EPISTLE_STORAGE__DATA_DIR": data,
+            "EPISTLE_STORAGE__FILE_RETENTION_SECS": "12",
+            "EPISTLE_STORAGE__DISK_RESERVE_BYTES": "0",
+            "EPISTLE_MAIL__RECONCILE_SECS": "1",
+            "EPISTLE_MAIL__WATCHDOG_SECS": "10",
+            "EPISTLE_DELIVERY__WEBHOOK_SECRET": SECRET,
+            "EPISTLE_DELIVERY__WEBHOOK_URL": MOCK + "/webhook",
+            "EPISTLE_AUTH__MASTER_KEY": "01" * 32,
+            "EPISTLE_AUTH__GOOGLE__CLIENT_ID": "test",
+            "EPISTLE_AUTH__GOOGLE__CLIENT_SECRET": "test",
+            "EPISTLE_TESTING__ALLOW_INSECURE_ENDPOINTS": "true",
+            "EPISTLE_TESTING__TOKEN_ENDPOINT_OVERRIDE": MOCK + "/token",
+        }
+
         log=open(pathlib.Path(data)/"service.log","w+")
         def start():
             p=subprocess.Popen([str(ROOT/"target/debug/epistle-server")],env=env,stdout=log,stderr=log)

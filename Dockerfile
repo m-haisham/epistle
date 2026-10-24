@@ -38,6 +38,7 @@ COPY --from=builder --chown=10001:10001 /runtime/home/epistle /home/epistle
 # Preserve ownership compatibility with existing Epistle data volumes.
 USER 10001:10001
 WORKDIR /home/epistle
+# Keep legacy defaults overridable by existing deployments; EPISTLE_ names take precedence.
 ENV DATA_DIR=/home/epistle/data BIND_ADDR=0.0.0.0:8080
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/epistle"]

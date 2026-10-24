@@ -30,15 +30,22 @@ class Service:
         self.log = open(pathlib.Path(directory) / "service.log", "w+")
         self.process = None
         self.env = {
-            "API_KEY": KEY, "MASTER_KEY": "01" * 32, "WEBHOOK_SECRET": SECRET,
-            "WEBHOOK_URL": ("http://mock:8090" if image else MOCK) + "/webhook",
-            "TOKEN_ENDPOINT_OVERRIDE": ("http://mock:8090" if image else MOCK) + "/token",
-            "PUBLIC_URL": BASE, "ALLOW_INSECURE_TEST_ENDPOINTS": "true",
-            "DATA_DIR": "/home/epistle/data" if image else directory,
-            "BIND_ADDR": "0.0.0.0:8080" if image else "127.0.0.1:18080",
-            "GOOGLE_CLIENT_ID": "test", "GOOGLE_CLIENT_SECRET": "test",
-            "MICROSOFT_CLIENT_ID": "test", "MICROSOFT_CLIENT_SECRET": "test",
-            "RECONCILE_SECS": "1", "WATCHDOG_SECS": "5", "DISK_RESERVE_BYTES": "0",
+            "EPISTLE_SERVER__API_KEY": KEY,
+            "EPISTLE_SERVER__PUBLIC_URL": BASE,
+            "EPISTLE_SERVER__BIND_ADDR": "0.0.0.0:8080" if image else "127.0.0.1:18080",
+            "EPISTLE_STORAGE__DATA_DIR": "/home/epistle/data" if image else directory,
+            "EPISTLE_STORAGE__DISK_RESERVE_BYTES": "0",
+            "EPISTLE_MAIL__RECONCILE_SECS": "1",
+            "EPISTLE_MAIL__WATCHDOG_SECS": "5",
+            "EPISTLE_DELIVERY__WEBHOOK_SECRET": SECRET,
+            "EPISTLE_DELIVERY__WEBHOOK_URL": ("http://mock:8090" if image else MOCK) + "/webhook",
+            "EPISTLE_AUTH__MASTER_KEY": "01" * 32,
+            "EPISTLE_AUTH__GOOGLE__CLIENT_ID": "test",
+            "EPISTLE_AUTH__GOOGLE__CLIENT_SECRET": "test",
+            "EPISTLE_AUTH__MICROSOFT__CLIENT_ID": "test",
+            "EPISTLE_AUTH__MICROSOFT__CLIENT_SECRET": "test",
+            "EPISTLE_TESTING__ALLOW_INSECURE_ENDPOINTS": "true",
+            "EPISTLE_TESTING__TOKEN_ENDPOINT_OVERRIDE": ("http://mock:8090" if image else MOCK) + "/token",
         }
 
     def start(self):

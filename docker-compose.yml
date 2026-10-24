@@ -15,18 +15,18 @@ services:
     build: .
     stop_grace_period: 5m
     environment:
-      BIND_ADDR: 0.0.0.0:8080
-      API_KEY: local-test-api-key-0000000000000000
-      MASTER_KEY: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-      WEBHOOK_URL: http://mock:8090/webhook
-      WEBHOOK_SECRET: local-test-webhook-secret-00000000
-      ALLOW_INSECURE_TEST_ENDPOINTS: "true"
-      PUBLIC_URL: http://localhost:8080
-      TOKEN_ENDPOINT_OVERRIDE: http://mock:8090/token
-      GOOGLE_CLIENT_ID: local-test
-      GOOGLE_CLIENT_SECRET: local-test
-      RECONCILE_SECS: 2
-      DISK_RESERVE_BYTES: 0
+      EPISTLE_SERVER__BIND_ADDR: 0.0.0.0:8080
+      EPISTLE_SERVER__API_KEY: local-test-api-key-0000000000000000
+      EPISTLE_AUTH__MASTER_KEY: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+      EPISTLE_DELIVERY__WEBHOOK_URL: http://mock:8090/webhook
+      EPISTLE_DELIVERY__WEBHOOK_SECRET: local-test-webhook-secret-00000000
+      EPISTLE_TESTING__ALLOW_INSECURE_ENDPOINTS: "true"
+      EPISTLE_SERVER__PUBLIC_URL: http://localhost:8080
+      EPISTLE_TESTING__TOKEN_ENDPOINT_OVERRIDE: http://mock:8090/token
+      EPISTLE_AUTH__GOOGLE__CLIENT_ID: local-test
+      EPISTLE_AUTH__GOOGLE__CLIENT_SECRET: local-test
+      EPISTLE_MAIL__RECONCILE_SECS: 2
+      EPISTLE_STORAGE__DISK_RESERVE_BYTES: 0
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

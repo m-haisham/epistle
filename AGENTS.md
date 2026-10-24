@@ -4,7 +4,7 @@ Epistle is a single-tenant Rust IMAP ingestion service. Read [README.md](README.
 
 ## Repository map
 
-- `crates/core`: shared types and configuration.
+- `crates/core`: shared types; nested application configuration lives in `src/config.rs`.
 - `crates/store`: SQLx persistence, migrations, process epochs and status events.
 - `crates/auth`: encrypted credentials, consent and token lifecycle.
 - `crates/imap`: protocol handling and bounded sessions.
@@ -24,7 +24,7 @@ The adjacent `../hark` project is an incomplete reference, especially for email 
 - Use concise `//!` module documentation and `///` documentation for public behavior. Explain invariants and non-obvious decisions without narrating the code.
 - Follow workspace lints: no unsafe code, production panics, unchecked indexing, `unwrap`, `expect` or `todo`. Keep justified test allowances scoped to tests.
 - Use typed errors and sanitized operational reason codes. Parameterize SQL and keep writes in the store's serialized transaction path.
-- Use `config` for defaults, optional file settings and environment overrides. Keep new configuration documented in the example file and operations guide.
+- Use typed nested `config` settings for defaults, optional TOML and `EPISTLE_` environment overrides (`__` separates sections). Preserve documented legacy aliases and layering when adding settings. Keep changes documented in the example file and operations guide.
 - Use `tracing` for library instrumentation; initialize `tracing-subscriber` only in the server. Use async-safe spans and skip sensitive arguments. Never log credentials, OAuth codes/state, authorization headers, message contents or raw provider responses. HTTP tracing uses matched route templates, not raw URLs.
 
 ## Durability and shutdown invariants

@@ -66,37 +66,39 @@ Use the toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml); Rustup s
 cp epistle.example.toml epistle.toml
 
 # Generate these once, then retain them in your deployment's secret storage.
-export API_KEY="$(openssl rand -hex 32)"
-export MASTER_KEY="$(openssl rand -hex 32)"
-export WEBHOOK_SECRET="$(openssl rand -hex 32)"
-export WEBHOOK_URL="https://your-app.example/webhooks/email"
-export PUBLIC_URL="https://email.example"
+export EPISTLE_SERVER__API_KEY="$(openssl rand -hex 32)"
+export EPISTLE_AUTH__MASTER_KEY="$(openssl rand -hex 32)"
+export EPISTLE_DELIVERY__WEBHOOK_SECRET="$(openssl rand -hex 32)"
+export EPISTLE_DELIVERY__WEBHOOK_URL="https://your-app.example/webhooks/email"
+export EPISTLE_SERVER__PUBLIC_URL="https://email.example"
 
 cargo run --locked -p epistle-server
 ```
 
-Keep `MASTER_KEY` stable across restarts and back it up separately. Replacing it makes existing encrypted credentials unreadable. The server defaults to `127.0.0.1:8080`; use a reverse proxy for public HTTPS.
+Keep `EPISTLE_AUTH__MASTER_KEY` stable across restarts and back it up separately. Replacing it makes existing encrypted credentials unreadable. The server defaults to `127.0.0.1:8080`; use a reverse proxy for public HTTPS.
 
-Configuration precedence is **defaults → optional `epistle.toml` → environment** through the `config` crate. Environment names are uppercase field names; secrets stay strings during parsing. SQLx migrations run automatically at startup.
+Application settings are grouped into `[server]`, `[storage]`, `[mail]`, `[mail.fetch]`, `[delivery]`, `[auth]`, `[auth.google]`, `[auth.microsoft]` and `[testing]`. The Rust types use the same hierarchy in `crates/core/src/config.rs`.
+
+Configuration precedence is **defaults → optional `epistle.toml` → environment** through the `config` crate. Environment names start with `EPISTLE_`, with `__` between sections: `mail.fetch.batch_count` becomes `EPISTLE_MAIL__FETCH__BATCH_COUNT`. Secrets stay strings during parsing. Existing flat file keys and unprefixed environment names remain supported; see [configuration migration](docs/operations.md#configuration-migration). SQLx migrations run automatically at startup.
 
 | Setting | Purpose / default |
 | --- | --- |
-| `API_KEY` | Required bearer key, at least 32 characters |
-| `MASTER_KEY` | Required encryption key, 32 bytes encoded as 64 hex characters |
-| `WEBHOOK_SECRET` | Required signing secret, at least 32 characters |
-| `WEBHOOK_URL` | Required HTTPS destination |
-| `PUBLIC_URL` | Public API origin; OAuth callback is `/oauth/callback` |
-| `DATA_DIR` | SQLite and message files; defaults to `./data` |
-| `BIND_ADDR` | Listen address; defaults to `127.0.0.1:8080` |
+| `EPISTLE_SERVER__API_KEY` | Required bearer key, at least 32 characters |
+| `EPISTLE_AUTH__MASTER_KEY` | Required encryption key, 32 bytes encoded as 64 hex characters |
+| `EPISTLE_DELIVERY__WEBHOOK_SECRET` | Required signing secret, at least 32 characters |
+| `EPISTLE_DELIVERY__WEBHOOK_URL` | Required HTTPS destination |
+| `EPISTLE_SERVER__PUBLIC_URL` | Public API origin; OAuth callback is `/oauth/callback` |
+| `EPISTLE_STORAGE__DATA_DIR` | SQLite and message files; defaults to `./data` |
+| `EPISTLE_SERVER__BIND_ADDR` | Listen address; defaults to `127.0.0.1:8080` |
 | `RUST_LOG` | Tracing filter; defaults to `info` |
 
-OAuth clients use `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` or `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET`. Creating an OAuth account without a refresh token returns a `redirect_url` for consent. See [authentication providers](docs/operations.md#authentication-providers) for scopes, service accounts and tenant configuration.
+OAuth clients use `EPISTLE_AUTH__GOOGLE__CLIENT_ID` / `EPISTLE_AUTH__GOOGLE__CLIENT_SECRET` or `EPISTLE_AUTH__MICROSOFT__CLIENT_ID` / `EPISTLE_AUTH__MICROSOFT__CLIENT_SECRET`. Creating an OAuth account without a refresh token returns a `redirect_url` for consent. See [authentication providers](docs/operations.md#authentication-providers) for scopes, service accounts and tenant configuration.
 
-Verified IMAP TLS is the default. `ALLOW_INSECURE_TEST_ENDPOINTS=true` explicitly enables local HTTP/plaintext test endpoints and token endpoint overrides. The example TOML and operations guide cover all limits and retention settings.
+Verified IMAP TLS is the default. `EPISTLE_TESTING__ALLOW_INSECURE_ENDPOINTS=true` explicitly enables local HTTP/plaintext test endpoints and token endpoint overrides. The example TOML and operations guide cover all limits and retention settings.
 
 ## API and delivery contract
 
-Business endpoints, including `/health`, require `Authorization: Bearer <API_KEY>`. `/scalar` and `/openapi.json` are public. The OAuth callback uses signed, expiring, single-use state. Scalar loads a pinned, integrity-checked browser bundle from jsDelivr; API calls stay on the service origin and authentication is not persisted by Scalar.
+Business endpoints, including `/health`, require `Authorization: Bearer <EPISTLE_SERVER__API_KEY>`. `/scalar` and `/openapi.json` are public. The OAuth callback uses signed, expiring, single-use state. Scalar loads a pinned, integrity-checked browser bundle from jsDelivr; API calls stay on the service origin and authentication is not persisted by Scalar.
 
 | Operation | Routes |
 | --- | --- |

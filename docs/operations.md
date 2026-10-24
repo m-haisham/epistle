@@ -2,16 +2,28 @@
 
 ## Configuration
 
-`config` loads built-in defaults, an optional `epistle.toml` in the working directory, and then environment overrides. Environment names are the uppercase field names from `epistle.example.toml`. Additional fields:
+`config` loads typed defaults, an optional `epistle.toml` in the working directory, and then environment overrides. Settings are grouped by subsystem; see [`epistle.example.toml`](../epistle.example.toml). Environment names use the `EPISTLE_` prefix and double underscores between sections. For example, `[mail.fetch] batch_count` becomes `EPISTLE_MAIL__FETCH__BATCH_COUNT`. Unrelated environment variables are ignored; unknown configuration keys fail startup instead of silently using defaults.
+
+| TOML section | Purpose |
+| --- | --- |
+| `[server]` | Listener, public URL and API key |
+| `[storage]` | Data directory, retention and disk reserve |
+| `[mail]`, `[mail.fetch]` | IMAP watchdog/reconciliation, body limits and batch size |
+| `[delivery]` | Webhook destination, signing secret and retries |
+| `[auth]` | Master key and reauthorization reminders |
+| `[auth.google]`, `[auth.microsoft]` | OAuth client credentials |
+| `[testing]` | Explicit insecure endpoint opt-ins |
+
+Secrets and provider credentials:
 
 | Environment variable | Purpose |
 | --- | --- |
-| `API_KEY` | At least 32 characters; bearer authentication |
-| `MASTER_KEY` | Exactly 32 random bytes encoded as 64 hex characters |
-| `WEBHOOK_SECRET` | At least 32 characters; webhook and OAuth state authentication |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google authorization-code and refresh flow |
-| `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET` | Entra authorization-code and refresh flow |
-| `TOKEN_ENDPOINT_OVERRIDE` | Local test-only OAuth endpoint |
+| `EPISTLE_SERVER__API_KEY` | At least 32 characters; bearer authentication |
+| `EPISTLE_AUTH__MASTER_KEY` | Exactly 32 random bytes encoded as 64 hex characters |
+| `EPISTLE_DELIVERY__WEBHOOK_SECRET` | At least 32 characters; webhook and OAuth state authentication |
+| `EPISTLE_AUTH__GOOGLE__CLIENT_ID`, `EPISTLE_AUTH__GOOGLE__CLIENT_SECRET` | Google authorization-code and refresh flow |
+| `EPISTLE_AUTH__MICROSOFT__CLIENT_ID`, `EPISTLE_AUTH__MICROSOFT__CLIENT_SECRET` | Entra authorization-code and refresh flow |
+| `EPISTLE_TESTING__TOKEN_ENDPOINT_OVERRIDE` | Local test-only OAuth endpoint |
 | `RUST_LOG` | Tracing filter, default `info` |
 
 Keep SQLite and the file store on one local persistent volume. An OS lock prevents two processes owning the same data directory. An epoch checked inside every write transaction fences stale writers. The SQLx read pool is read-only; a bounded channel feeds one dedicated write connection. Migration checksums detect changed historical migrations.
@@ -22,9 +34,17 @@ Give the process enough time to drain: Compose allows five minutes, and manual c
 
 The server installs `tracing-subscriber` once. Set `RUST_LOG=info,epistle_email=debug,epistle_auth=debug` for account and token diagnostics. Structured spans correlate account IDs, worker roles, delivery IDs and HTTP request IDs. HTTP traces record route templates, status and latency, excluding query strings, headers and bodies. Application instrumentation skips credentials and message contents. The `shutdown complete` event confirms that workers and database writes drained.
 
+## Configuration migration
+
+Old flat TOML keys and unprefixed environment variables remain accepted. Migrate files by moving keys under the sections shown in the example. For instance, `data_dir` becomes `[storage] data_dir`, `fetch_batch_count` becomes `[mail.fetch] batch_count`, and `google_client_id` becomes `[auth.google] client_id`.
+
+Layer precedence is **defaults → file → legacy environment → `EPISTLE_` environment**. Within a file, an explicit nested key wins over its flat alias. Environment overrides merge individual fields, preserving sibling values from the file. If both `API_KEY` and `EPISTLE_SERVER__API_KEY` are present, the latter wins. Digit-only secrets and leading zeros are preserved.
+
+The container retains its legacy `DATA_DIR` and `BIND_ADDR` defaults so existing deployment overrides still work. Compose and new examples use the nested environment names. `RUST_LOG` remains the tracing subscriber's own setting and is not renamed. No database migration is needed; per-account IMAP settings in the API keep their existing shape.
+
 ## Authentication providers
 
-Set the provider's redirect URI to `${PUBLIC_URL}/oauth/callback`. Create an account with `auth_kind: google_oauth` or `microsoft_oauth`, email, external reference and optional config. The response contains `redirect_url`; opening it completes authorization code + PKCE. `POST /email/accounts/{id}/credentials` with `{}` starts a new consent flow. A refresh token can also be supplied explicitly as `credentials.refresh_token`.
+Set the provider's redirect URI to `${EPISTLE_SERVER__PUBLIC_URL}/oauth/callback`. Create an account with `auth_kind: google_oauth` or `microsoft_oauth`, email, external reference and optional config. The response contains `redirect_url`; opening it completes authorization code + PKCE. `POST /email/accounts/{id}/credentials` with `{}` starts a new consent flow. A refresh token can also be supplied explicitly as `credentials.refresh_token`.
 
 Google requests `https://mail.google.com/`, which covers IMAP and SMTP. Public applications using this scope must satisfy Google's verification requirements. Workspace service-account accounts use `auth_kind: google_service_account` and `credentials: { client_email, private_key }`; the key is a PEM RSA private key and the Workspace administrator must grant domain-wide delegation for `https://mail.google.com/`. The service mints an RS256 assertion with the mailbox as `sub`. [Google's IMAP OAuth documentation](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol) describes the scopes and delegation requirements.
 
