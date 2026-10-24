@@ -38,6 +38,7 @@ pub struct Service {
     pub config: Arc<Config>,
 }
 impl Service {
+    /// Opens a session and returns its planned recycle deadline, not raw token expiry.
     pub async fn connect(&self, a: &Account) -> Result<(Connection, i64), Error> {
         let access = self.tokens.get_access_token(a, false).await?;
         let recycle_at = access.recycle_at(&a.id);

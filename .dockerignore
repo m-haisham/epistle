@@ -4,3 +4,4 @@ target
 data
 .env
 epistle.toml
+**/__pycache__

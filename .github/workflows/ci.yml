@@ -5,6 +5,8 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      COMPOSE_PROJECT_NAME: epistle
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -18,6 +20,8 @@ jobs:
       - run: cargo build --locked -p epistle-server
       - run: docker compose up -d --build dovecot mock
       - run: python3 tests/integration.py
+      - run: docker compose build epistle
+      - run: python3 tests/token_expiry.py --image epistle-epistle:latest
       - if: failure()
         run: docker compose logs
       - if: always()

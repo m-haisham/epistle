@@ -16,7 +16,10 @@ def issuer():
 
 class Service:
     def __init__(self, directory, image):
-        self.image = image
+        # A rebuild of the tag during the test must not switch binaries on restart.
+        self.image = subprocess.check_output(
+            ["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True
+        ).strip() if image else None
         self.name = "epistle-expiry-" + uuid.uuid4().hex
         self.volume = self.name + "-data"
         self.log = open(pathlib.Path(directory) / "service.log", "w+")
@@ -77,7 +80,8 @@ def exercise(service, kind):
     def append(label):
         mid = uuid.uuid4().hex
         expected.add(mid)
-        assert box.append(folder, None, None, mail(mid, label, attachment=True))[0] == "OK"
+        result = box.append(folder, None, None, mail(mid, label, attachment=True))
+        assert result[0] == "OK", result
     def delivered():
         return [e["body"]["message"] for e in events(account, "email.message.received")]
     def caught_up():
@@ -161,15 +165,22 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="epistle-expiry-") as directory:
         service = Service(directory, args.image)
+        succeeded = False
         try:
             service.start()
             for kind in ("google_oauth", "microsoft_oauth"):
                 exercise(service, kind)
+            succeeded = True
         except BaseException:
             service.log.flush(); service.log.seek(0); print(service.log.read())
             raise
         finally:
-            service.close()
+            try:
+                service.close()
+            except subprocess.CalledProcessError as error:
+                print("Cleanup failed for", service.name, service.volume, error.stderr)
+                if succeeded:
+                    raise
             control(strict_rotation=False, token_lifetime=3600, token_failures=0)
     print("PASS: OAuth expiry suite" + (" on " + args.image if args.image else " on host"), flush=True)
 

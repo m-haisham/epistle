@@ -14,6 +14,8 @@ docker compose up --build
 
 The Compose environment is explicitly for local testing. It uses test credentials, a plaintext IMAP connection on the private Docker network, and binds exposed ports to loopback. The API is at `http://localhost:8080`; the webhook recorder is at `http://localhost:8090/events`.
 
+The Docker build uses cargo-chef to cache dependencies and compiles a fully static musl binary. The runtime is `gcr.io/distroless/static-debian13:nonroot`, with no shell or package manager. It runs as UID/GID `10001:10001` to preserve compatibility with existing Epistle volumes. See [container deployment](docs/operations.md#container-deployment) for volume permissions and verification.
+
 Create a test account:
 
 ```sh
@@ -57,11 +59,14 @@ cargo test --locked --workspace
 cargo build --locked -p epistle-server
 docker compose up -d --build dovecot mock
 python3 tests/integration.py
+# Repeat OAuth expiry/restart tests against the actual distroless image.
+docker compose build epistle
+python3 tests/token_expiry.py --image epistle-epistle:latest
 cargo audit
 cargo deny check
 ```
 
-Rust tests use loopback HTTP servers for token and delivery tests. The integration suite starts its own service on port 18080 with a temporary data directory and uses Dovecot on port 1143 and the mock on port 8090. It covers initial/live sync, attachments, signatures, ranges, read/unread, cross-folder dedupe, backfills, restart catch-up, UIDVALIDITY fallback, dead replay, real XOAUTH2, revoked-token recovery, encryption, retention, and ordered status events. SQL transaction failures are injected at discovery, handoff, and delivery acknowledgment boundaries in Rust tests.
+Rust tests use loopback HTTP servers for token and delivery tests. The integration suite starts its own service on port 18080 with a temporary data directory and uses Dovecot on port 1143 and the mock on port 8090. It covers initial/live sync, attachments, signatures, ranges, read/unread, cross-folder dedupe, backfills, restart catch-up, UIDVALIDITY fallback, dead replay, real XOAUTH2, revoked-token recovery, encryption, retention, and ordered status events. The expiry suite tests both Google and Microsoft account strategies with 12-second tokens, a rotating refresh token that becomes invalid after use, natural reconnects, process crashes, provider disconnects, and temporary token-endpoint failures. It checks catch-up, deduplication, files, and commands after restart. Omit `--image` to test the host debug binary. Run the suites sequentially: they share the mock and port 18080. SQL transaction failures are injected at discovery, handoff, and delivery acknowledgment boundaries in Rust tests.
 
 GitHub Actions runs the checks above, and Dependabot proposes weekly dependency updates. Duplicate transitive crate versions are reported by `cargo deny`; advisories, unapproved licenses, wildcard dependencies, and unknown sources fail the checks.
 
