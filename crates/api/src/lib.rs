@@ -1,3 +1,5 @@
+//! Authenticated HTTP operations and generated API documentation.
+
 use aide::{
     OperationOutput,
     axum::{
@@ -30,22 +32,30 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
+use tracing::Instrument;
+
+/// Shared services used by HTTP handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
     pub tokens: TokenProvider,
     pub config: Arc<Config>,
 }
+
+/// Sanitized API error response.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ErrorBody {
     pub error: String,
 }
+
+/// HTTP status and public error code.
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct ApiError {
     status: StatusCode,
     message: String,
 }
+
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
@@ -53,16 +63,20 @@ impl ApiError {
             message: message.into(),
         }
     }
+
     fn bad(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
+
     fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found")
     }
+
     fn gone() -> Self {
         Self::new(StatusCode::GONE, "expired")
     }
 }
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
@@ -74,6 +88,7 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
+
 impl OperationOutput for ApiError {
     type Inner = ErrorBody;
     fn inferred_responses(
@@ -90,6 +105,7 @@ impl OperationOutput for ApiError {
             .collect()
     }
 }
+
 impl From<epistle_store::Error> for ApiError {
     fn from(e: epistle_store::Error) -> Self {
         match e {
@@ -106,11 +122,13 @@ impl From<epistle_store::Error> for ApiError {
         }
     }
 }
+
 impl From<sqlx::Error> for ApiError {
     fn from(_: sqlx::Error) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "storage_error")
     }
 }
+
 impl From<epistle_auth::Error> for ApiError {
     fn from(e: epistle_auth::Error) -> Self {
         match e {
@@ -121,20 +139,31 @@ impl From<epistle_auth::Error> for ApiError {
         }
     }
 }
+
 impl From<serde_json::Error> for ApiError {
     fn from(_: serde_json::Error) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "payload_error")
     }
 }
+
 impl From<std::io::Error> for ApiError {
     fn from(_: std::io::Error) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "file_error")
     }
 }
 
+/// Builds authenticated operations, OpenAPI and the Scalar reference.
 pub fn router(state: AppState) -> axum::Router {
     aide::generate::infer_responses(true);
-    let mut api=OpenApi{info:Info{title:"Epistle Email API".into(),version:env!("CARGO_PKG_VERSION").into(),description:Some("Transport-neutral single-tenant email API. Authenticate with Authorization: Bearer <API_KEY>. Webhook signatures use HMAC-SHA256 over timestamp + '.' + exact request bytes.".into()),..Default::default()},..Default::default()};
+    let mut api = OpenApi {
+        info: Info {
+            title: "Epistle Email API".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            description: Some("Transport-neutral single-tenant email API. Authenticate with Authorization: Bearer <API_KEY>. Webhook signatures use HMAC-SHA256 over timestamp + '.' + exact request bytes.".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let protected = ApiRouter::new()
         .api_route("/email/accounts", post(create_account).get(list_accounts))
         .api_route(
@@ -158,8 +187,10 @@ pub fn router(state: AppState) -> axum::Router {
         .finish_api(&mut api);
     // Document security on every operation except the provider callback.
     let mut document = serde_json::to_value(api).unwrap_or_default();
+
     if let Some(root) = document.as_object_mut() {
         let components = root.entry("components").or_insert_with(|| json!({}));
+
         if let Some(components) = components.as_object_mut() {
             components.insert(
                 "securitySchemes".into(),
@@ -213,6 +244,7 @@ pub fn router(state: AppState) -> axum::Router {
         .and_then(Value::as_object_mut)
     {
         let responses = operation.entry("responses").or_insert_with(|| json!({}));
+
         if let Some(responses) = responses.as_object_mut() {
             let binary = json!({"description":"File bytes","content":{"application/octet-stream":{"schema":{"type":"string","format":"binary"}}},"headers":{"ETag":{"schema":{"type":"string"}},"Content-Length":{"schema":{"type":"integer"}},"Accept-Ranges":{"schema":{"type":"string"}}}});
             responses.insert("200".into(), binary.clone());
@@ -225,14 +257,43 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/scalar", axum::routing::get(scalar))
         .layer(Extension(Arc::new(document)))
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(middleware::from_fn(trace_request))
         .with_state(state)
 }
+
+/// Records route templates and timing without URLs, headers or request bodies.
+async fn trace_request(request: Request, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str())
+        .unwrap_or("unmatched");
+    let span =
+        tracing::info_span!("http_request", request_id = %id(), method = %request.method(), route);
+
+    async move {
+        let started = Instant::now();
+
+        let response = next.run(request).await;
+        tracing::info!(
+            status = response.status().as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "request completed"
+        );
+        response
+    }
+    .instrument(span)
+    .await
+}
+
 async fn openapi(Extension(api): Extension<Arc<Value>>) -> Json<Value> {
     Json((*api).clone())
 }
+
 async fn scalar() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("scalar.html"))
 }
+
 async fn authenticate(State(s): State<AppState>, request: Request, next: Next) -> Response {
     let key = request
         .headers()
@@ -242,11 +303,13 @@ async fn authenticate(State(s): State<AppState>, request: Request, next: Next) -
         .unwrap_or("");
     let got = Sha256::digest(key.as_bytes());
     let expected = Sha256::digest(s.config.api_key.as_bytes());
+
     if !bool::from(got.as_slice().ct_eq(expected.as_slice())) {
         return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     next.run(request).await
 }
+
 #[derive(Deserialize, JsonSchema, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct CredentialInput {
@@ -255,6 +318,7 @@ pub struct CredentialInput {
     client_email: Option<String>,
     private_key: Option<String>,
 }
+
 impl From<CredentialInput> for Credentials {
     fn from(c: CredentialInput) -> Self {
         Self {
@@ -266,6 +330,7 @@ impl From<CredentialInput> for Credentials {
         }
     }
 }
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAccount {
@@ -277,11 +342,13 @@ pub struct CreateAccount {
     #[serde(default)]
     credentials: CredentialInput,
 }
+
 #[derive(Serialize, JsonSchema)]
 pub struct AccountCreated {
     account: Account,
     redirect_url: Option<String>,
 }
+
 fn validate_credentials(kind: AuthKind, c: &Credentials) -> Result<(), ApiError> {
     match kind {
         AuthKind::Password if c.password.as_ref().is_none_or(|p| p.is_empty()) => {
@@ -296,6 +363,7 @@ fn validate_credentials(kind: AuthKind, c: &Credentials) -> Result<(), ApiError>
         _ => Ok(()),
     }
 }
+
 async fn create_account(
     State(s): State<AppState>,
     Json(mut body): Json<CreateAccount>,
@@ -366,6 +434,7 @@ VALUES(?,?,?,?,?,?,?)
     } else {
         None
     };
+
     Ok((
         StatusCode::CREATED,
         Json(AccountCreated {
@@ -374,15 +443,18 @@ VALUES(?,?,?,?,?,?,?)
         }),
     ))
 }
+
 async fn list_accounts(State(s): State<AppState>) -> Result<Json<Vec<Account>>, ApiError> {
     Ok(Json(s.store.accounts().await?))
 }
+
 async fn get_account(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Account>, ApiError> {
     Ok(Json(s.store.account(&id).await?))
 }
+
 async fn update_credentials(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -398,17 +470,15 @@ async fn update_credentials(
     s.store
         .write(move |c| {
             Box::pin(async move {
-                sqlx::query(
-                    "
+                sqlx::query("
 UPDATE credentials SET ciphertext=?,access_expires_at=NULL,refresh_expires_at=NULL,scopes='[]',updated_at=?
 WHERE account_id=?
-",
-                )
-                .bind(sealed)
-                .bind(now())
-                .bind(&aid)
-                .execute(&mut *c)
-                .await?;
+")
+                    .bind(sealed)
+                    .bind(now())
+                    .bind(&aid)
+                    .execute(&mut *c)
+                    .await?;
                 sqlx::query("UPDATE accounts SET revision=revision+1,enabled=1 WHERE id=?")
                     .bind(&aid)
                     .execute(&mut *c)
@@ -438,15 +508,18 @@ WHERE account_id=?
     } else {
         None
     };
+
     Ok(Json(AccountCreated {
         account: a,
         redirect_url,
     }))
 }
+
 #[derive(Deserialize, JsonSchema)]
 struct Enabled {
     enabled: bool,
 }
+
 async fn set_enabled(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -476,8 +549,10 @@ async fn set_enabled(
             })
         })
         .await?;
+
     Ok(Json(s.store.account(&id).await?))
 }
+
 async fn remove_account(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -494,31 +569,38 @@ async fn remove_account(
                     .bind(id)
                     .execute(c)
                     .await?;
+
                 Ok(())
             })
         })
         .await?;
+
     for mid in mids {
         let path = s.config.data_dir.join("files").join(mid);
+
         match tokio::fs::remove_dir_all(path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
     }
+
     Ok(StatusCode::NO_CONTENT)
 }
+
 #[derive(Deserialize, JsonSchema)]
 struct Callback {
     state: String,
     code: Option<String>,
     error: Option<String>,
 }
+
 #[derive(Serialize, JsonSchema)]
 struct CallbackResult {
     account_id: String,
     status: String,
 }
+
 async fn callback(
     State(s): State<AppState>,
     Query(q): Query<Callback>,
@@ -526,6 +608,7 @@ async fn callback(
     if q.error.is_some() {
         return Err(ApiError::bad("authorization_denied"));
     }
+
     let account = s
         .tokens
         .callback(
@@ -535,11 +618,13 @@ async fn callback(
                 .ok_or_else(|| ApiError::bad("code_required"))?,
         )
         .await?;
+
     Ok(Json(CallbackResult {
         account_id: account,
         status: "connecting".into(),
     }))
 }
+
 async fn get_message(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -549,6 +634,7 @@ async fn get_message(
         .fetch_optional(&s.store.reads)
         .await?
         .ok_or_else(ApiError::not_found)?;
+
     if row.try_get::<bool, _>("expired")?
         || row
             .try_get::<Option<i64>, _>("expires_at")?
@@ -556,20 +642,25 @@ async fn get_message(
     {
         return Err(ApiError::gone());
     }
+
     let bytes = tokio::fs::read(row.try_get::<String, _>("payload_path")?).await?;
     let v: Value = serde_json::from_slice(&bytes)?;
+
     Ok(Json(serde_json::from_value(
         v.get("message").cloned().ok_or_else(ApiError::not_found)?,
     )?))
 }
+
 #[derive(Deserialize, JsonSchema)]
 struct ReadInput {
     read: bool,
 }
+
 #[derive(Serialize, JsonSchema)]
 struct CommandCreated {
     command_id: String,
 }
+
 async fn mark_read(
     State(s): State<AppState>,
     Path(mid): Path<String>,
@@ -599,16 +690,20 @@ VALUES(?,?,?,'mark_read',?,?)
                 .bind(now())
                 .execute(c)
                 .await?;
+
                 Ok(())
             })
         })
         .await?;
+
     Ok((StatusCode::ACCEPTED, Json(CommandCreated { command_id })))
 }
+
 #[derive(Deserialize, JsonSchema, Default)]
 struct Wait {
     wait: Option<String>,
 }
+
 #[derive(Serialize, JsonSchema)]
 struct CommandStatus {
     id: String,
@@ -617,6 +712,7 @@ struct CommandStatus {
     last_error: Option<String>,
     completed_at: Option<i64>,
 }
+
 async fn get_command(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -631,6 +727,7 @@ async fn get_command(
         0
     };
     let deadline = Instant::now() + Duration::from_secs(wait);
+
     loop {
         let r = sqlx::query("SELECT * FROM commands WHERE id=?")
             .bind(&id)
@@ -644,12 +741,14 @@ async fn get_command(
             last_error: r.try_get("last_error")?,
             completed_at: r.try_get("completed_at")?,
         };
+
         if status.state != "pending" || Instant::now() >= deadline {
             return Ok(Json(status));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct BackfillInput {
@@ -661,16 +760,19 @@ struct BackfillInput {
     #[serde(default)]
     redeliver: bool,
 }
+
 #[derive(Serialize, JsonSchema)]
 struct BackfillCreated {
     backfill_id: String,
 }
+
 async fn create_backfill(
     State(s): State<AppState>,
     Path(account): Path<String>,
     Json(input): Json<BackfillInput>,
 ) -> Result<(StatusCode, Json<BackfillCreated>), ApiError> {
     s.store.account(&account).await?;
+
     if input.until.is_some_and(|u| u <= input.since)
         || input.folders.as_ref().is_some_and(|f| {
             f.is_empty()
@@ -681,6 +783,7 @@ async fn create_backfill(
     {
         return Err(ApiError::bad("invalid_backfill_range_or_folders"));
     }
+
     let job = id();
     let j = job.clone();
     s.store
@@ -708,15 +811,18 @@ VALUES(?,?,?,?,?,?,?,?)
                 .bind(now())
                 .execute(c)
                 .await?;
+
                 Ok(())
             })
         })
         .await?;
+
     Ok((
         StatusCode::ACCEPTED,
         Json(BackfillCreated { backfill_id: job }),
     ))
 }
+
 #[derive(Serialize, JsonSchema)]
 struct BackfillStatus {
     id: String,
@@ -726,6 +832,7 @@ struct BackfillStatus {
     delivered: i64,
     last_error: Option<String>,
 }
+
 async fn get_backfill(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -735,6 +842,7 @@ async fn get_backfill(
         .fetch_optional(&s.store.reads)
         .await?
         .ok_or_else(ApiError::not_found)?;
+
     Ok(Json(BackfillStatus {
         id,
         state: r.try_get("state")?,
@@ -744,6 +852,7 @@ async fn get_backfill(
         last_error: r.try_get("last_error")?,
     }))
 }
+
 async fn cancel_backfill(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -759,6 +868,7 @@ async fn cancel_backfill(
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
+
                 if changed == 0 {
                     return Err(epistle_store::Error::NotFound);
                 }
@@ -766,12 +876,15 @@ async fn cancel_backfill(
                     .bind(id)
                     .execute(c)
                     .await?;
+
                 Ok(())
             })
         })
         .await?;
+
     Ok(StatusCode::NO_CONTENT)
 }
+
 #[derive(Serialize, JsonSchema)]
 struct OutboxItem {
     id: i64,
@@ -781,10 +894,12 @@ struct OutboxItem {
     last_error: Option<String>,
     created_at: i64,
 }
+
 async fn list_outbox(State(s): State<AppState>) -> Result<Json<Vec<OutboxItem>>, ApiError> {
     let rows = sqlx::query("SELECT * FROM outbox ORDER BY seq LIMIT 500")
         .fetch_all(&s.store.reads)
         .await?;
+
     Ok(Json(
         rows.into_iter()
             .map(|r| {
@@ -800,6 +915,7 @@ async fn list_outbox(State(s): State<AppState>) -> Result<Json<Vec<OutboxItem>>,
             .collect::<Result<Vec<_>, sqlx::Error>>()?,
     ))
 }
+
 async fn replay(State(s): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, ApiError> {
     s.store
         .write(move |c| {
@@ -814,15 +930,19 @@ seq=? AND state='dead'
                 .execute(c)
                 .await?
                 .rows_affected();
+
                 if changed == 0 {
                     return Err(epistle_store::Error::Conflict("delivery_not_dead"));
                 }
+
                 Ok(())
             })
         })
         .await?;
+
     Ok(StatusCode::ACCEPTED)
 }
+
 async fn discard(State(s): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, ApiError> {
     let retention = s.config.file_retention_secs;
     s.store
@@ -868,17 +988,21 @@ message_key=?)
                 .bind(key)
                 .execute(c)
                 .await?;
+
                 Ok(())
             })
         })
         .await?;
+
     Ok(StatusCode::NO_CONTENT)
 }
+
 #[derive(Serialize, JsonSchema)]
 struct FolderError {
     id: String,
     reason: String,
 }
+
 #[derive(Serialize, JsonSchema)]
 struct AccountHealth {
     id: String,
@@ -889,6 +1013,7 @@ struct AccountHealth {
     refresh_token_expires_at: Option<i64>,
     folder_errors: Vec<FolderError>,
 }
+
 #[derive(Serialize, JsonSchema)]
 struct HealthResponse {
     status: String,
@@ -898,6 +1023,7 @@ struct HealthResponse {
     dead_deliveries: i64,
     dead_fetches: i64,
 }
+
 async fn health(State(s): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let r = sqlx::query(
         "
@@ -909,6 +1035,7 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
     .await?;
     let accounts = s.store.accounts().await?;
     let mut account_health = vec![];
+
     for a in accounts {
         let oldest: Option<i64> = sqlx::query_scalar(
             "SELECT MIN(created_at) FROM fetch_queue WHERE account_id=? AND state='pending'",
@@ -923,8 +1050,10 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
         .fetch_optional(&s.store.reads)
         .await?
         .flatten();
-        let folder_errors: Vec<(String,String)> = sqlx::query_as("SELECT id,last_error FROM folders WHERE account_id=? AND last_error IS NOT NULL ORDER BY id")
-            .bind(&a.id).fetch_all(&s.store.reads).await?;
+        let folder_errors: Vec<(String, String)> = sqlx::query_as("SELECT id,last_error FROM folders WHERE account_id=? AND last_error IS NOT NULL ORDER BY id")
+            .bind(&a.id)
+            .fetch_all(&s.store.reads)
+            .await?;
         account_health.push(AccountHealth {
             id: a.id,
             status: a.status,
@@ -937,9 +1066,11 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
                 .collect(),
         });
     }
+
     let dead_fetch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fetch_queue WHERE state='dead'")
         .fetch_one(&s.store.reads)
         .await?;
+
     Ok(Json(HealthResponse {
         status: "ok".into(),
         accounts: account_health,
@@ -958,27 +1089,33 @@ pub fn byte_range(value: &str, size: u64) -> Result<(u64, u64), ApiError> {
         .split_once('-')
         .ok_or_else(|| ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid_range"))?;
     let invalid = || ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid_range");
+
     if size == 0 || range.contains(',') {
         return Err(invalid());
     }
     if start.is_empty() {
         let n = end.parse::<u64>().map_err(|_| invalid())?;
+
         if n == 0 {
             return Err(invalid());
         }
         return Ok((size.saturating_sub(n), size - 1));
     }
+
     let start = start.parse::<u64>().map_err(|_| invalid())?;
     let end = if end.is_empty() {
         size - 1
     } else {
         end.parse::<u64>().map_err(|_| invalid())?.min(size - 1)
     };
+
     if start >= size || end < start {
         return Err(invalid());
     }
+
     Ok((start, end))
 }
+
 async fn download(
     State(s): State<AppState>,
     Path((mid, fid)): Path<(String, String)>,
@@ -990,13 +1127,16 @@ async fn download(
         .fetch_optional(&s.store.reads)
         .await?
         .ok_or_else(ApiError::not_found)?;
+
     if r.try_get::<bool, _>("expired")?
         || r.try_get::<Option<i64>, _>("expires_at")?
             .is_some_and(|t| t <= now())
     {
         return Err(ApiError::gone());
     }
+
     let etag = format!("\"{}\"", r.try_get::<String, _>("sha256")?);
+
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -1004,6 +1144,7 @@ async fn download(
     {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
+
     let size = r.try_get::<i64, _>("size")? as u64;
     let mut file = tokio::fs::File::open(r.try_get::<String, _>("path")?).await?;
     let requested = headers
@@ -1078,6 +1219,7 @@ mod tests {
         assert_eq!(byte_range("bytes=-3", 10).unwrap(), (7, 9));
         assert_eq!(byte_range("bytes=-999", 10).unwrap(), (0, 9));
         assert_eq!(byte_range("bytes=0-999", 10).unwrap(), (0, 9));
+
         for value in [
             "bytes=10-",
             "bytes=9-8",
@@ -1111,6 +1253,7 @@ mod reference_tests {
             store,
             config: config.clone(),
         });
+
         let response = app
             .clone()
             .oneshot(
@@ -1141,6 +1284,7 @@ mod reference_tests {
         assert!(html.contains("url: '/openapi.json'"));
         assert!(html.contains("Scalar.createApiReference"));
         assert!(!html.contains(&config.api_key));
+
         let response = app
             .clone()
             .oneshot(
@@ -1177,6 +1321,7 @@ mod reference_tests {
                 .pointer("/paths/~1oauth~1callback/get/security")
                 .is_none()
         );
+
         let response = app
             .clone()
             .oneshot(
@@ -1188,6 +1333,7 @@ mod reference_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         let response = app
             .oneshot(
                 Request::builder()

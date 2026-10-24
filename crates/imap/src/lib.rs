@@ -1,3 +1,5 @@
+//! Bounded IMAP sessions with checked command completion.
+
 use epistle_core::{Account, Pointer};
 use imap_proto::{AttributeValue, MailboxDatum, Response, Status};
 use secrecy::{ExposeSecret, SecretString};
@@ -12,6 +14,7 @@ use tokio_rustls::{
     TlsConnector,
     rustls::{ClientConfig, RootCertStore, pki_types::ServerName},
 };
+
 #[derive(Debug, Error, Clone)]
 #[error("IMAP operation failed: {reason}")]
 pub struct Error {
@@ -19,6 +22,7 @@ pub struct Error {
     pub permanent: bool,
     pub auth: bool,
 }
+
 impl Error {
     fn transient(reason: &'static str) -> Self {
         Self {
@@ -28,12 +32,14 @@ impl Error {
         }
     }
 }
+
 impl From<async_imap::error::Error> for Error {
     fn from(e: async_imap::error::Error) -> Self {
         // Interpret only allow-listed provider response codes; never retain raw server text.
         match e {
             async_imap::error::Error::No(s) | async_imap::error::Error::Bad(s) => {
                 let u = s.to_ascii_uppercase();
+
                 if u.contains("AUTHENTICATIONFAILED") {
                     Self {
                         reason: "credentials_rejected",
@@ -83,17 +89,20 @@ impl From<async_imap::error::Error> for Error {
 trait Io: AsyncRead + AsyncWrite + Unpin + Send + Debug {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Debug> Io for T {}
 type Session = async_imap::Session<Box<dyn Io>>;
+/// Authenticated IMAP session with bounded operations.
 pub struct Connection {
     session: Session,
     pub gmail: bool,
     pub idle_supported: bool,
     timeout: Duration,
 }
+
 struct Xoauth {
     email: String,
     token: SecretString,
     sent: bool,
 }
+
 impl async_imap::Authenticator for Xoauth {
     type Response = String;
     fn process(&mut self, _: &[u8]) -> String {
@@ -108,6 +117,7 @@ impl async_imap::Authenticator for Xoauth {
         )
     }
 }
+
 async fn bounded<T>(
     duration: Duration,
     f: impl std::future::Future<Output = Result<T, async_imap::error::Error>>,
@@ -117,7 +127,10 @@ async fn bounded<T>(
         .map_err(|_| Error::transient("connection_lost"))?
         .map_err(Into::into)
 }
+
 impl Connection {
+    /// Consumes the greeting, negotiates capabilities and authenticates.
+    #[tracing::instrument(skip_all, fields(account_id = %a.id))]
     pub async fn connect(
         a: &Account,
         secret: SecretString,
@@ -154,6 +167,7 @@ impl Connection {
                 .await
                 .map_err(|_| Error::transient("connection_lost"))?
                 .ok_or(Error::transient("connection_lost"))?;
+
             match greeting.parsed() {
                 imap_proto::Response::Data {
                     status: imap_proto::Status::Ok,
@@ -179,6 +193,7 @@ impl Connection {
                 }
                 _ => return Err(Error::transient("invalid_greeting")),
             }
+
             let session = if password {
                 client.login(&a.email, secret.expose_secret()).await
             } else {
@@ -198,6 +213,7 @@ impl Connection {
                     async_imap::error::Error::No(s) | async_imap::error::Error::Bad(s)
                     if s.to_ascii_uppercase().contains("[UNAVAILABLE]"));
                 let mut classified = Error::from(e);
+
                 if classified.reason == "provider_outage" && !explicit_outage {
                     classified.auth = true;
                     classified.reason = "credentials_rejected";
@@ -218,19 +234,25 @@ impl Connection {
             };
             connection.gmail = has("X-GM-EXT-1");
             connection.idle_supported = has("IDLE");
+
             if has("ENABLE") && has("CONDSTORE") {
                 connection.checked("ENABLE CONDSTORE".into()).await?;
             }
+
             Ok(connection)
         })
         .await
         .map_err(|_| Error::transient("server_unreachable"))?
     }
+
+    /// Returns configured folders or discovers selectable mailboxes.
     pub async fn folders(&mut self, a: &Account) -> Result<Vec<String>, Error> {
         if !a.config.folders.is_empty() {
             return Ok(a.config.folders.clone());
         }
+
         let names = self.checked("LIST \"\" \"*\"".into()).await?.mailboxes;
+
         if self.gmail {
             if let Some(all) = names.iter().find(|n| {
                 n.name_attributes
@@ -242,7 +264,9 @@ impl Connection {
             }
             return Ok(vec!["[Gmail]/All Mail".into()]);
         }
+
         let mut result = vec!["INBOX".into()];
+
         if let Some(sent) = names.iter().find(|n| {
             n.name_attributes
                 .iter()
@@ -251,17 +275,24 @@ impl Connection {
         }) {
             result.push(sent.name.as_ref().into());
         }
+
         Ok(result)
     }
+
+    /// Selects a mailbox without granting write access.
     pub async fn examine(&mut self, folder: &str) -> Result<async_imap::types::Mailbox, Error> {
         bounded(self.timeout, self.session.examine(folder)).await
     }
+
+    /// Returns UIDs only after the search completes successfully.
     pub async fn search(&mut self, query: &str) -> Result<Vec<u32>, Error> {
         let mut ids = self.checked(format!("UID SEARCH {query}")).await?.ids;
         ids.sort_unstable();
         ids.dedup();
+
         Ok(ids)
     }
+
     /// Unlike async-imap's streaming helpers, check the tagged completion before
     /// exposing partial data. A rejected command must never advance a cursor or
     /// become a successful STORE / an empty successful FETCH.
@@ -273,6 +304,7 @@ impl Connection {
                 .await
                 .map_err(Error::from)?;
             let mut responses = Checked::default();
+
             loop {
                 let response = self
                     .session
@@ -280,6 +312,7 @@ impl Connection {
                     .await
                     .map_err(|_| Error::transient("connection_lost"))?
                     .ok_or_else(|| Error::transient("connection_lost"))?;
+
                 match response.parsed() {
                     Response::Done {
                         tag: got,
@@ -323,6 +356,7 @@ impl Connection {
         .await
         .map_err(|_| Error::transient("connection_lost"))?
     }
+
     async fn fetch_data(&mut self, ids: &str, query: &str) -> Result<Vec<Fetched>, Error> {
         Ok(self
             .checked(format!("UID FETCH {ids} {query}"))
@@ -332,6 +366,8 @@ impl Connection {
             .filter(|f| f.uid.is_some_and(|uid| requested_uid(ids, uid)))
             .collect())
     }
+
+    /// Fetches complete discovery records for the requested UIDs.
     pub async fn metadata(
         &mut self,
         a: &Account,
@@ -346,6 +382,7 @@ impl Connection {
             "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE)"
         };
         let fetched = self.fetch_data(ids, query).await?;
+
         Ok(fetched
             .into_iter()
             // Unsolicited FLAGS/MODSEQ updates are not discovery records, even
@@ -369,6 +406,8 @@ impl Connection {
             })
             .collect())
     }
+
+    /// Recovers a pointer after UIDVALIDITY changes using exact identity.
     pub async fn resolve(&mut self, p: &Pointer, write: bool) -> Result<Option<Pointer>, Error> {
         let mailbox = if write {
             bounded(self.timeout, self.session.select(&p.folder)).await
@@ -386,6 +425,7 @@ impl Connection {
             auth: false,
         })?);
         let mut resolved = p.clone();
+
         if validity != p.uidvalidity {
             let Some(mid) = p.rfc_message_id.as_ref() else {
                 return Ok(None);
@@ -396,6 +436,7 @@ impl Connection {
             // IMAP HEADER searches are substring matches. Never FETCH/STORE a
             // different message just because its Message-ID contains this one.
             let mut exact = None;
+
             for chunk in ids.chunks(500) {
                 let set = chunk
                     .iter()
@@ -407,16 +448,21 @@ impl Connection {
                     .iter()
                     .find(|f| f.message_id.as_deref() == Some(mid.as_str()))
                     .and_then(|f| f.uid);
+
                 if exact.is_some() {
                     break;
                 }
             }
+
             let Some(uid) = exact else { return Ok(None) };
             resolved.uid = i64::from(uid);
             resolved.uidvalidity = validity;
         }
+
         Ok(Some(resolved))
     }
+
+    /// Fetches raw message bytes without marking the message as read.
     pub async fn fetch(&mut self, p: &Pointer) -> Result<Option<(Pointer, Vec<u8>)>, Error> {
         let Some(p) = self.resolve(p, false).await? else {
             return Ok(None);
@@ -424,31 +470,41 @@ impl Connection {
         let fetched = self
             .fetch_data(&p.uid.to_string(), "(UID BODY.PEEK[])")
             .await?;
+
         Ok(fetched
             .into_iter()
             .find(|f| f.uid.map(i64::from) == Some(p.uid))
             .and_then(|f| f.body.map(|b| (p, b))))
     }
+
+    /// Applies an idempotent read flag update and returns the resolved pointer.
     pub async fn mark_read(&mut self, p: &Pointer, read: bool) -> Result<Option<Pointer>, Error> {
         let Some(p) = self.resolve(p, true).await? else {
             return Ok(None);
         };
+
         if self.search(&format!("UID {}", p.uid)).await?.is_empty() {
             return Ok(None);
         }
+
         let cmd = if read {
             "+FLAGS.SILENT (\\Seen)"
         } else {
             "-FLAGS.SILENT (\\Seen)"
         };
         self.checked(format!("UID STORE {} {cmd}", p.uid)).await?;
+
         Ok(Some(p))
     }
+
+    /// Waits for mailbox changes until the reconciliation deadline.
     pub async fn idle(self, seconds: u64) -> Result<Self, Error> {
         if !self.idle_supported {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
+
             return Ok(self);
         }
+
         let Self {
             session,
             gmail,
@@ -464,7 +520,9 @@ impl Connection {
                 result.map_err(Error::from)?;
             }
         }
+
         let session = bounded(duration, handle.done()).await?;
+
         Ok(Self {
             session,
             gmail,
@@ -472,10 +530,14 @@ impl Connection {
             timeout: duration,
         })
     }
+
+    /// Attempts a bounded logout before closing the session.
     pub async fn logout(mut self) {
         let _ = bounded(self.timeout, self.session.logout()).await;
     }
 }
+
+/// Escapes an IMAP string and rejects protocol control characters.
 pub fn quote(s: &str) -> Result<String, Error> {
     if s.chars().any(char::is_control) {
         return Err(Error {
@@ -484,6 +546,7 @@ pub fn quote(s: &str) -> Result<String, Error> {
             auth: false,
         });
     }
+
     Ok(format!(
         "\"{}\"",
         s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -497,6 +560,7 @@ struct Checked {
     mailboxes: Vec<imap_proto::MailboxListData<'static>>,
     capabilities: Vec<String>,
 }
+
 #[derive(Default)]
 struct Fetched {
     uid: Option<u32>,
@@ -510,9 +574,11 @@ struct Fetched {
     flags: Vec<String>,
     body: Option<Vec<u8>>,
 }
+
 impl From<&[AttributeValue<'_>]> for Fetched {
     fn from(attrs: &[AttributeValue<'_>]) -> Self {
         let mut result = Self::default();
+
         for attr in attrs {
             match attr {
                 AttributeValue::Uid(uid) => result.uid = Some(*uid),
@@ -585,6 +651,7 @@ mod tests {
         assert!(auth.process(b"").contains("auth=Bearer secret-token"));
         assert_eq!(auth.process(br#"{"status":"401"}"#), "");
     }
+
     #[test]
     fn provider_error_text_does_not_escape_and_search_is_quoted() {
         let e = Error::from(async_imap::error::Error::No(

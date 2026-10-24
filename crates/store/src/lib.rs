@@ -1,12 +1,16 @@
+//! SQLite persistence with serialized transactions and process fencing.
+
 use epistle_core::{Account, id, now};
 use futures::future::BoxFuture;
 use sqlx::{
     Connection, Row, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::Instrument;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("database operation failed")]
@@ -24,14 +28,27 @@ pub enum Error {
     #[error("conflict: {0}")]
     Conflict(&'static str),
 }
+
 type Job = Box<dyn for<'c> FnOnce(&'c mut SqliteConnection, i64) -> BoxFuture<'c, ()> + Send>;
+
+enum WriteRequest {
+    Write(Job),
+    Shutdown,
+}
+
+type Writer = Arc<Mutex<Option<tokio::task::JoinHandle<Result<(), sqlx::Error>>>>>;
+
+/// Cloneable read pool and serialized transaction writer.
 #[derive(Clone)]
 pub struct Store {
     pub reads: SqlitePool,
-    sender: mpsc::Sender<Job>,
+    sender: mpsc::Sender<WriteRequest>,
+    writer: Writer,
     pub epoch: i64,
 }
+
 impl Store {
+    /// Runs migrations, acquires a new epoch and starts the writer.
     pub async fn open(path: &Path) -> Result<Self, Error> {
         let opts = SqliteConnectOptions::new()
             .filename(path)
@@ -50,18 +67,46 @@ impl Store {
             .max_connections(4)
             .connect_with(opts.read_only(true))
             .await?;
-        let (sender, mut receiver) = mpsc::channel::<Job>(256);
-        tokio::spawn(async move {
-            while let Some(job) = receiver.recv().await {
-                job(&mut conn, epoch).await;
+        let (sender, mut receiver) = mpsc::channel::<WriteRequest>(256);
+        let writer = tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    WriteRequest::Write(job) => job(&mut conn, epoch).await,
+                    WriteRequest::Shutdown => receiver.close(),
+                }
             }
+
+            conn.close().await
         });
+        tracing::info!(epoch, "database writer started");
+
         Ok(Self {
             reads,
             sender,
+            writer: Arc::new(Mutex::new(Some(writer))),
             epoch,
         })
     }
+
+    /// Rejects new writes, drains accepted transactions, and closes all connections.
+    /// Call after HTTP handlers and workers have stopped.
+    pub async fn close(&self) -> Result<(), Error> {
+        let mut writer = self.writer.lock().await;
+
+        if let Some(task) = writer.as_mut() {
+            let _ = self.sender.send(WriteRequest::Shutdown).await;
+
+            let result = task.await.map_err(|_| Error::Closed);
+            *writer = None;
+            self.reads.close().await;
+            result??;
+            tracing::info!(epoch = self.epoch, "database writer drained and closed");
+        }
+
+        Ok(())
+    }
+
+    /// Commits a fenced transaction; accepted jobs survive caller cancellation.
     pub async fn write<T, F>(&self, f: F) -> Result<T, Error>
     where
         T: Send + 'static,
@@ -70,30 +115,41 @@ impl Store {
             + 'static,
     {
         let (send, receive) = oneshot::channel();
+        let span = tracing::Span::current();
         self.sender
-            .send(Box::new(move |conn, epoch| {
-                Box::pin(async move {
-                    let result = async {
-                        let mut tx = conn.begin().await?;
-                        let actual: i64 =
-                            sqlx::query_scalar("SELECT epoch FROM service_epoch WHERE singleton=1")
-                                .fetch_one(&mut *tx)
-                                .await?;
-                        if actual != epoch {
-                            return Err(Error::Fenced);
+            .send(WriteRequest::Write(Box::new(move |conn, epoch| {
+                Box::pin(
+                    async move {
+                        let result = async {
+                            let mut tx = conn.begin().await?;
+                            let actual: i64 = sqlx::query_scalar(
+                                "SELECT epoch FROM service_epoch WHERE singleton=1",
+                            )
+                            .fetch_one(&mut *tx)
+                            .await?;
+
+                            if actual != epoch {
+                                return Err(Error::Fenced);
+                            }
+
+                            let value = f(&mut tx).await?;
+                            tx.commit().await?;
+                            tracing::trace!(epoch, "database transaction committed");
+
+                            Ok(value)
                         }
-                        let value = f(&mut tx).await?;
-                        tx.commit().await?;
-                        Ok(value)
+                        .await;
+                        let _ = send.send(result);
                     }
-                    .await;
-                    let _ = send.send(result);
-                })
-            }))
+                    .instrument(span),
+                )
+            })))
             .await
             .map_err(|_| Error::Closed)?;
         receive.await.map_err(|_| Error::Closed)?
     }
+
+    /// Loads one account by its opaque ID.
     pub async fn account(&self, account_id: &str) -> Result<Account, Error> {
         let r = sqlx::query("SELECT * FROM accounts WHERE id=?")
             .bind(account_id)
@@ -102,6 +158,8 @@ impl Store {
             .ok_or(Error::NotFound)?;
         account_from_row(&r)
     }
+
+    /// Lists persisted accounts.
     pub async fn accounts(&self) -> Result<Vec<Account>, Error> {
         sqlx::query("SELECT * FROM accounts")
             .fetch_all(&self.reads)
@@ -110,6 +168,8 @@ impl Store {
             .map(account_from_row)
             .collect()
     }
+
+    /// Commits a status transition and its ordered webhook event.
     pub async fn status(
         &self,
         account_id: &str,
@@ -127,6 +187,7 @@ impl Store {
         })
         .await
     }
+
     /// Fence account workers too: a disabled account or replaced credential revision
     /// must not be overwritten by a connection finishing an old round trip.
     pub async fn status_for_revision(
@@ -149,14 +210,18 @@ impl Store {
                         .bind(&a)
                         .fetch_optional(&mut *c)
                         .await?;
+
                 if current == Some(revision) {
                     status_tx(c, &a, &s, r.as_deref(), failures).await?;
                 }
+
                 Ok(())
             })
         })
         .await
     }
+
+    /// Updates the operational worker state.
     pub async fn worker_state(&self, account_id: &str, state: &str) -> Result<(), Error> {
         let (a, s) = (account_id.to_owned(), state.to_owned());
         self.write(move |c| {
@@ -166,12 +231,14 @@ impl Store {
                     .bind(a)
                     .execute(c)
                     .await?;
+
                 Ok(())
             })
         })
         .await
     }
 }
+
 fn account_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<Account, Error> {
     Ok(Account {
         id: r.try_get("id")?,
@@ -190,6 +257,7 @@ fn account_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<Account, Error> {
     })
 }
 
+/// Writes a status transition and event within the caller’s transaction.
 pub async fn status_tx(
     c: &mut SqliteConnection,
     a: &str,
@@ -206,6 +274,7 @@ pub async fn status_tx(
     .ok_or(Error::NotFound)?;
     let prev: String = r.try_get("status")?;
     let seq: i64 = r.try_get("status_seq")?;
+
     if seq > 0
         && prev == status
         && r.try_get::<Option<String>, _>("status_reason")?.as_deref() == reason
@@ -213,6 +282,7 @@ pub async fn status_tx(
     {
         return Ok(());
     }
+
     let seq = seq + 1;
     let t = now();
     sqlx::query(
@@ -275,6 +345,7 @@ VALUES(?,?,?,?,?,?,?,?)
     .bind(t)
     .execute(c)
     .await?;
+
     Ok(())
 }
 
@@ -296,6 +367,7 @@ VALUES('a','ref','\"password\"','a@example.test','{}',0,0)
                     )
                     .execute(c)
                     .await?;
+
                     Ok(())
                 })
             })
@@ -303,6 +375,7 @@ VALUES('a','ref','\"password\"','a@example.test','{}',0,0)
             .unwrap();
         (dir, store)
     }
+
     #[tokio::test]
     async fn migrations_wal_atomic_rollback_and_epoch_fencing() {
         let (dir, store) = fixture().await;
@@ -335,9 +408,11 @@ VALUES('a','ref','\"password\"','a@example.test','{}',0,0)
         ));
         newer.status("a", "active", None, 0).await.unwrap();
     }
+
     #[tokio::test]
     async fn transitions_are_atomic_edge_triggered_and_ordered() {
         let (_dir, store) = fixture().await;
+
         for (status, reason, failures) in [
             ("connecting", None, 0),
             ("active", None, 0),
@@ -349,6 +424,7 @@ VALUES('a','ref','\"password\"','a@example.test','{}',0,0)
         ] {
             store.status("a", status, reason, failures).await.unwrap();
         }
+
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM connection_events")
             .fetch_one(&store.reads)
             .await
@@ -374,6 +450,7 @@ e.message_key=o.message_key AND e.seq<o.seq AND e.state='pending')
         .unwrap();
         assert_eq!(ready, 1);
     }
+
     #[tokio::test]
     async fn old_account_revision_cannot_override_disable_or_reauthentication() {
         let (_dir, store) = fixture().await;
@@ -418,5 +495,73 @@ e.message_key=o.message_key AND e.seq<o.seq AND e.state='pending')
             .await
             .unwrap();
         assert_eq!(store.account("a").await.unwrap().status, "active");
+    }
+
+    #[tokio::test]
+    async fn close_drains_accepted_writes_even_if_the_caller_is_cancelled() {
+        let (dir, store) = fixture().await;
+        let (started, entered) = oneshot::channel();
+        let (release, gate) = oneshot::channel();
+        let writer = store.clone();
+        let caller = tokio::spawn(async move {
+            writer
+                .write(move |c| {
+                    Box::pin(async move {
+                        let _ = started.send(());
+                        let _ = gate.await;
+                        sqlx::query("UPDATE accounts SET external_ref='committed' WHERE id='a'")
+                            .execute(c)
+                            .await?;
+
+                        Ok(())
+                    })
+                })
+                .await
+        });
+        entered.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+
+        let queued_writer = store.clone();
+        let queued =
+            tokio::spawn(async move {
+                queued_writer.write(|c| Box::pin(async move {
+                sqlx::query("UPDATE accounts SET external_ref=external_ref||'-queued' WHERE id='a'")
+                    .execute(c).await?;
+                Ok(())
+            })).await
+            });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while store.sender.capacity() == 256 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let closer = store.clone();
+        let closing = tokio::spawn(async move { closer.close().await });
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), closing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            store.write(|_| Box::pin(async { Ok(()) })).await,
+            Err(Error::Closed)
+        ));
+        assert!(store.reads.is_closed());
+        queued.await.unwrap().unwrap();
+        store.close().await.unwrap();
+
+        let restarted = Store::open(&dir.path().join("test.sqlite")).await.unwrap();
+        assert_eq!(
+            restarted.account("a").await.unwrap().external_ref,
+            "committed-queued"
+        );
+        restarted.close().await.unwrap();
     }
 }

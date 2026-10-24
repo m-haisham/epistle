@@ -26,6 +26,7 @@ subtle.workspace = true
 sha2.workspace = true
 hex.workspace = true
 chrono.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,3 +1,5 @@
+//! Account supervision and durable email ingestion.
+
 mod parse;
 mod queue;
 mod workers;
@@ -6,6 +8,7 @@ use epistle_core::{Account, Config, backoff, now};
 use epistle_delivery::FileStore;
 use epistle_imap::Connection;
 use epistle_store::Store;
+
 pub use parse::parse_message;
 pub use queue::{enqueue, handoff};
 use std::{
@@ -15,6 +18,8 @@ use std::{
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("database operation failed")]
@@ -34,6 +39,8 @@ pub enum Error {
     #[error("planned token recycle")]
     Recycle,
 }
+
+/// Supervises account workers and their durable queues.
 #[derive(Clone)]
 pub struct Service {
     pub store: Store,
@@ -41,11 +48,13 @@ pub struct Service {
     pub files: FileStore,
     pub config: Arc<Config>,
 }
+
 impl Service {
     /// Opens a session and returns its planned recycle deadline, not raw token expiry.
     pub async fn connect(&self, a: &Account) -> Result<(Connection, i64), Error> {
         let access = self.tokens.get_access_token(a, false).await?;
         let recycle_at = access.recycle_at(&a.id);
+
         match Connection::connect(a, access.secret, access.password, self.config.watchdog_secs)
             .await
         {
@@ -53,6 +62,7 @@ impl Service {
             Err(e) if e.auth && a.auth_kind != epistle_core::AuthKind::Password => {
                 let access = self.tokens.get_access_token(a, true).await?;
                 let recycle_at = access.recycle_at(&a.id);
+
                 match Connection::connect(a, access.secret, false, self.config.watchdog_secs).await
                 {
                     Ok(c) => Ok((c, recycle_at)),
@@ -65,19 +75,28 @@ impl Service {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Stops scheduling on cancellation and waits for account workers to drain.
     pub async fn run(self, cancel: CancellationToken) {
         let mut accounts: HashMap<String, (i64, CancellationToken, tokio::task::JoinHandle<()>)> =
             HashMap::new();
+
         loop {
-            tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{}}
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+
             let all = match self.store.accounts().await {
                 Ok(a) => a,
                 Err(e) => {
-                    tracing::error!(error=%e,"account enumeration failed");
+                    tracing::error!(error = %e, "account enumeration failed");
                     continue;
                 }
             };
             let mut remove = vec![];
+
             for (id, (revision, _, task)) in &accounts {
                 if !all
                     .iter()
@@ -87,10 +106,13 @@ impl Service {
                     remove.push(id.clone());
                 }
             }
+
             let mut panicked = HashSet::new();
+
             for id in remove {
                 if let Some((revision, stop, task)) = accounts.remove(&id) {
                     stop.cancel();
+
                     if task.await.is_err() {
                         panicked.insert(id.clone());
                         let _ = self
@@ -101,6 +123,10 @@ impl Service {
                 }
             }
             for a in all {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
                 if !a.enabled
                     || panicked.contains(&a.id)
                     || accounts.contains_key(&a.id)
@@ -109,17 +135,23 @@ impl Service {
                 {
                     continue;
                 }
+
                 let service = self.clone();
                 let stop = cancel.child_token();
                 let child = stop.clone();
                 let account = a.clone();
-                let task = tokio::spawn(async move {
-                    if account.status == "needs_reauth" {
-                        service.remind(&account, &child).await;
-                    } else {
-                        service.supervise(account, child).await;
+                let span =
+                    tracing::info_span!("account", account_id = %a.id, revision = a.revision);
+                let task = tokio::spawn(
+                    async move {
+                        if account.status == "needs_reauth" {
+                            service.remind(&account, &child).await;
+                        } else {
+                            service.supervise(account, child).await;
+                        }
                     }
-                });
+                    .instrument(span),
+                );
                 accounts.insert(a.id, (a.revision, stop, task));
             }
         }
@@ -127,8 +159,34 @@ impl Service {
             stop.cancel();
             let _ = task.await;
         }
+        tracing::info!("account workers stopped");
     }
+
+    /// Stops sibling workers on failure and drains every in-flight operation.
+    async fn run_workers(&self, a: &Account, cancel: &CancellationToken) -> Result<(), Error> {
+        let stop = cancel.child_token();
+        let finish = |result: Result<(), Error>| {
+            if result.is_err() {
+                stop.cancel();
+            }
+            result
+        };
+        let (watch, fetch, commands) = tokio::join!(
+            async { finish(self.watch(a, &stop).await) },
+            async { finish(self.fetch_worker(a, &stop).await) },
+            async { finish(self.command_worker(a, &stop).await) },
+        );
+
+        watch?;
+        fetch?;
+        commands
+    }
+
     async fn supervise(self, a: Account, cancel: CancellationToken) {
+        if cancel.is_cancelled() {
+            return;
+        }
+
         let mut failures = a.consecutive_failures;
         let mut first_failure = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT first_failure_at FROM accounts WHERE id=?",
@@ -144,17 +202,20 @@ impl Service {
             .store
             .status_for_revision(&a.id, a.revision, "connecting", None, failures)
             .await;
+
         loop {
-            let run = async {
-                tokio::try_join!(
-                    self.watch(&a),
-                    self.fetch_worker(&a),
-                    self.command_worker(&a)
-                )?;
-                Ok::<(), Error>(())
-            };
-            let result = tokio::select! {_=cancel.cancelled()=>return,r=run=>r};
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            let result = self.run_workers(&a, &cancel).await;
+
+            if cancel.is_cancelled() {
+                return;
+            }
+
             let Err(error) = result else { return };
+
             if matches!(error, Error::Recycle) {
                 failures = 0;
                 let _ = self
@@ -179,9 +240,11 @@ impl Service {
                 first_failure = 0;
             }
             failures += 1;
+
             if first_failure == 0 {
                 first_failure = now();
             }
+
             let (status, reason, permanent) = match &error {
                 Error::Auth(epistle_auth::Error::Reauth(reason)) => ("needs_reauth", *reason, true),
                 Error::Auth(epistle_auth::Error::Unconfigured | epistle_auth::Error::Data) => {
@@ -199,6 +262,7 @@ impl Service {
                 Error::Auth(_) => ("degraded", "provider_outage", false),
                 _ => ("degraded", "internal_error", false),
             };
+
             if failures == 1 && !permanent {
                 let _ = self
                     .store
@@ -211,26 +275,34 @@ impl Service {
                     )
                     .await;
             }
+
             let _ = self
                 .store
                 .status_for_revision(&a.id, a.revision, status, Some(reason), failures)
                 .await;
             let _ = self.store.worker_state(&a.id, "backoff").await;
-            tracing::warn!(account_id=%a.id,reason,failures,"account connection interrupted");
+            tracing::warn!(account_id = %a.id, reason, failures, "account connection interrupted");
+
             if permanent {
                 if status == "needs_reauth" && self.config.reauth_reminder_secs > 0 {
                     self.remind(&a, &cancel).await;
                 }
                 return;
             }
+
             let delay = if reason == "credentials_rejected" {
                 60
             } else {
                 backoff(failures)
             };
-            tokio::select! {_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(delay as u64))=>{}}
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(delay as u64)) => {}
+            }
         }
     }
+
     async fn remind(&self, a: &Account, cancel: &CancellationToken) {
         if self.config.reauth_reminder_secs <= 0 {
             return;
@@ -240,15 +312,18 @@ impl Service {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(Duration::from_secs(self.config.reauth_reminder_secs as u64)) => {}
             }
+
             let Ok(current) = self.store.account(&a.id).await else {
                 return;
             };
+
             if !current.enabled
                 || current.revision != a.revision
                 || current.status != "needs_reauth"
             {
                 return;
             }
+
             let _ = self
                 .store
                 .status_for_revision(

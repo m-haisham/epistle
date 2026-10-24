@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+tracing.workspace = true
 imap-proto.workspace = true
 epistle-core.workspace = true
 async-imap.workspace = true

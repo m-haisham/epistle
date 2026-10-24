@@ -1,3 +1,5 @@
+//! Encrypted credentials and provider token lifecycles.
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
@@ -14,6 +16,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("credential storage failed")]
@@ -34,6 +37,7 @@ pub enum Error {
     State,
 }
 // Intentionally no Debug: credentials must never appear in traces.
+/// Secret provider credentials encrypted before persistence.
 #[derive(Default, Clone, Serialize, Deserialize, Zeroize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Credentials {
@@ -47,6 +51,7 @@ pub struct Credentials {
     pub client_email: Option<String>,
     pub private_key: Option<String>,
 }
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     key_id: String,
@@ -55,18 +60,25 @@ struct Envelope {
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
 }
+
+/// Account-bound authenticated encryption for credentials.
 #[derive(Clone)]
 pub struct Vault {
     master: Arc<Zeroizing<[u8; 32]>>,
 }
+
 impl Vault {
+    /// Constructs a vault from a hexadecimal master key.
     pub fn new(key: &str) -> Result<Self, Error> {
         let bytes = Zeroizing::new(hex::decode(key).map_err(|_| Error::Crypto)?);
         let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| Error::Crypto)?;
+
         Ok(Self {
             master: Arc::new(Zeroizing::new(key)),
         })
     }
+
+    /// Encrypts bytes using the account ID as authenticated context.
     pub fn seal(&self, account: &str, plaintext: &[u8]) -> Result<String, Error> {
         let key = Zeroizing::new(rand::random::<[u8; 32]>());
         let nonce = rand::random::<[u8; 12]>();
@@ -101,6 +113,8 @@ impl Vault {
         })
         .map_err(|_| Error::Data)
     }
+
+    /// Decrypts account-bound credentials into zeroizing memory.
     pub fn open(&self, account: &str, sealed: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
         let e: Envelope = serde_json::from_str(sealed).map_err(|_| Error::Crypto)?;
         let master = ChaCha20Poly1305::new_from_slice(self.master.as_ref().as_ref())
@@ -117,6 +131,7 @@ impl Vault {
                 .map_err(|_| Error::Crypto)?,
         );
         let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| Error::Crypto)?;
+
         Ok(Zeroizing::new(
             cipher
                 .decrypt(
@@ -130,6 +145,8 @@ impl Vault {
         ))
     }
 }
+
+/// Serializes token refreshes and persists replacements before use.
 #[derive(Clone)]
 pub struct TokenProvider {
     pub store: Store,
@@ -140,12 +157,15 @@ pub struct TokenProvider {
     #[cfg(test)]
     refresh_save_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
+
+/// An access credential and its connection recycle deadline.
 pub struct Access {
     pub secret: SecretString,
     pub expires_at: i64,
     pub refresh_at: i64,
     pub password: bool,
 }
+
 impl Access {
     /// Recycle only once the cached token is refreshable. Short-lived tokens need
     /// a proportionally smaller margin or they cause an immediate reconnect loop.
@@ -153,10 +173,12 @@ impl Access {
         if self.password {
             return i64::MAX;
         }
+
         let jitter = i64::from(account_id.bytes().next().unwrap_or(0) % 30);
         (self.expires_at - 60 - jitter).max(self.refresh_at)
     }
 }
+
 impl Credentials {
     fn refresh_at(&self) -> i64 {
         let expiry = self.access_expires_at.unwrap_or(0);
@@ -167,6 +189,7 @@ impl Credentials {
         expiry.saturating_sub(margin)
     }
 }
+
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -175,7 +198,9 @@ struct TokenResponse {
     expires_in: Option<i64>,
     scope: Option<String>,
 }
+
 impl TokenProvider {
+    /// Builds credential storage and a bounded provider HTTP client.
     pub fn new(store: Store, config: Arc<Config>) -> Result<Self, Error> {
         let vault = Vault::new(&config.master_key)?;
         let client = reqwest::Client::builder()
@@ -183,6 +208,7 @@ impl TokenProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| Error::Temporary)?;
+
         Ok(Self {
             store,
             vault,
@@ -193,6 +219,8 @@ impl TokenProvider {
             refresh_save_gate: None,
         })
     }
+
+    /// Serializes credential changes for one account.
     pub async fn lock(&self, a: &str) -> tokio::sync::OwnedMutexGuard<()> {
         self.locks
             .lock()
@@ -203,6 +231,8 @@ impl TokenProvider {
             .lock_owned()
             .await
     }
+
+    /// Loads and decrypts the account’s credentials.
     pub async fn load(&self, a: &str) -> Result<Zeroizing<Credentials>, Error> {
         let sealed: Option<String> =
             sqlx::query_scalar("SELECT ciphertext FROM credentials WHERE account_id=?")
@@ -216,30 +246,52 @@ impl TokenProvider {
             .map(Zeroizing::new)
             .map_err(|_| Error::Data)
     }
+
     pub fn encrypt_credentials(&self, a: &str, c: &Credentials) -> Result<String, Error> {
         self.vault.seal(
             a,
             &Zeroizing::new(serde_json::to_vec(c).map_err(|_| Error::Data)?),
         )
     }
+
+    /// Encrypts and persists credentials and expiry metadata.
     pub async fn save(&self, a: &str, c: &Credentials) -> Result<(), Error> {
         let sealed = self.encrypt_credentials(a, c)?;
         let a = a.to_owned();
         let exp = c.access_expires_at;
         let refresh_exp = c.refresh_token_expires_at;
         let scopes = serde_json::to_string(&c.scopes).map_err(|_| Error::Data)?;
-        self.store.write(move |db|Box::pin(async move { sqlx::query("
+        self.store
+            .write(move |db| {
+                Box::pin(async move {
+                    sqlx::query("
 INSERT INTO credentials(account_id,ciphertext,access_expires_at,refresh_expires_at,scopes,updated_at)
 VALUES(?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
 ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refresh_expires_at=excluded.refresh_expires_at,scopes=excluded.scopes,updated_at=excluded.updated_at
 ")
-   .bind(a).bind(sealed).bind(exp).bind(refresh_exp).bind(scopes).bind(now()).execute(db).await?;
- Ok(()) })).await?;
+                        .bind(a)
+                        .bind(sealed)
+                        .bind(exp)
+                        .bind(refresh_exp)
+                        .bind(scopes)
+                        .bind(now())
+                        .execute(db)
+                        .await?;
+
+                    Ok(())
+                })
+            })
+            .await?;
+
         Ok(())
     }
+
+    /// Returns cached access or durably saves a provider refresh before returning.
+    #[tracing::instrument(skip_all, fields(account_id = %a.id, force))]
     pub async fn get_access_token(&self, a: &Account, force: bool) -> Result<Access, Error> {
         let _guard = self.lock(&a.id).await;
         let mut c = self.load(&a.id).await?;
+
         if a.auth_kind == AuthKind::Password {
             return Ok(Access {
                 secret: c
@@ -269,6 +321,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         {
             return Err(Error::Reauth("refresh_token_expired"));
         }
+
         let endpoint = self.endpoint(a);
         let form = if a.auth_kind == AuthKind::GoogleServiceAccount {
             #[derive(Serialize)]
@@ -280,6 +333,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 iat: i64,
                 exp: i64,
             }
+
             let claims = Claims {
                 iss: c.client_email.as_deref().ok_or(Error::Data)?,
                 sub: &a.email,
@@ -319,6 +373,8 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 ("client_secret", secret),
             ]
         };
+        tracing::debug!("requesting access token");
+
         let response = self.exchange(&endpoint, &form).await?;
         self.apply_response(a, &mut c, response, false)?;
         // The process-crash tests stop here, after a successful provider exchange
@@ -328,7 +384,9 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
             gate.0.notify_one();
             gate.1.notified().await;
         }
+
         self.save(&a.id, &c).await?;
+        tracing::info!("refreshed credentials committed");
         // A rotated refresh token is durable before the access token leaves this function.
         Ok(Access {
             secret: c.access_token.clone().ok_or(Error::Data)?.into(),
@@ -337,6 +395,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
             password: false,
         })
     }
+
     fn endpoint(&self, a: &Account) -> String {
         self.config
             .token_endpoint_override
@@ -352,12 +411,16 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 }
             })
     }
+
+    /// Validates that the provider’s client credentials are configured.
     pub fn ensure_configured(&self, kind: AuthKind) -> Result<(), Error> {
         if kind.oauth() {
             self.client_credentials(kind)?;
         }
+
         Ok(())
     }
+
     fn client_credentials(&self, kind: AuthKind) -> Result<(String, String), Error> {
         let (id, secret) = if kind == AuthKind::MicrosoftOauth {
             (
@@ -370,11 +433,14 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 &self.config.google_client_secret,
             )
         };
+
         if id.is_empty() {
             return Err(Error::Unconfigured);
         }
+
         Ok((id.clone(), secret.clone()))
     }
+
     async fn exchange(&self, url: &str, form: &[(&str, String)]) -> Result<TokenResponse, Error> {
         let response = self
             .client
@@ -384,11 +450,13 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
             .await
             .map_err(|_| Error::Temporary)?;
         let status = response.status();
+
         if status.is_server_error() || status.as_u16() == 429 {
             return Err(Error::Temporary);
         }
         if !status.is_success() {
             let body: serde_json::Value = response.json().await.map_err(|_| Error::Temporary)?;
+
             return Err(match body.get("error").and_then(|e| e.as_str()) {
                 Some("invalid_grant") => Error::Reauth("token_revoked"),
                 Some("interaction_required" | "consent_required") => {
@@ -404,6 +472,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         // Do not park the account as invalid local configuration on a transport error.
         response.json().await.map_err(|_| Error::Temporary)
     }
+
     fn apply_response(
         &self,
         a: &Account,
@@ -417,11 +486,13 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         if let Some(scope) = r.scope {
             c.scopes = scope.split_whitespace().map(str::to_owned).collect();
         }
+
         let required = if a.auth_kind == AuthKind::MicrosoftOauth {
             "https://outlook.office.com/IMAP.AccessAsUser.All"
         } else {
             "https://mail.google.com/"
         };
+
         if (require_scope || !c.scopes.is_empty())
             && !c.scopes.iter().any(|s| s.eq_ignore_ascii_case(required))
         {
@@ -431,6 +502,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         let issued = now();
         c.access_issued_at = Some(issued);
         c.access_expires_at = Some(issued + r.expires_in.unwrap_or(3600).clamp(1, 86400));
+
         if let Some(remaining) = r.refresh_token_expires_in {
             c.refresh_token_expires_at = Some(
                 issued
@@ -445,8 +517,11 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         if let Some(token) = r.refresh_token {
             c.refresh_token = Some(token);
         }
+
         Ok(())
     }
+
+    /// Creates a one-use authorization flow with signed state and PKCE.
     pub async fn authorization_url(&self, a: &Account) -> Result<String, Error> {
         let (client, _) = self.client_credentials(a.auth_kind)?;
         let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
@@ -486,6 +561,7 @@ VALUES(?,?,?,?,?)
                     .bind(revision)
                     .execute(c)
                     .await?;
+
                     Ok(())
                 })
             })
@@ -522,8 +598,12 @@ VALUES(?,?,?,?,?)
             ("prompt", "consent"),
             ("login_hint", &a.email),
         ]);
+
         Ok(url.into())
     }
+
+    /// Exchanges a one-use code and atomically activates its account.
+    #[tracing::instrument(skip_all, name = "oauth_callback")]
     pub async fn callback(&self, state: &str, code: &str) -> Result<String, Error> {
         let (unsigned, signature) = state.rsplit_once('.').ok_or(Error::State)?;
         let mut mac =
@@ -558,9 +638,11 @@ account_id,encrypted_verifier,revision
         let account_id: String = row.try_get("account_id")?;
         let _guard = self.lock(&account_id).await;
         let a = self.store.account(&account_id).await?;
+
         if a.revision != row.try_get::<i64, _>("revision")? {
             return Err(Error::State);
         }
+
         let verifier = self
             .vault
             .open(&a.id, &row.try_get::<String, _>("encrypted_verifier")?)?;
@@ -596,14 +678,24 @@ account_id,encrypted_verifier,revision
         self.store
             .write(move |db| {
                 Box::pin(async move {
-                    let current: Option<i64> = sqlx::query_scalar("SELECT revision FROM accounts WHERE id=?")
-                        .bind(&id).fetch_optional(&mut *db).await?;
+                    let current: Option<i64> =
+                        sqlx::query_scalar("SELECT revision FROM accounts WHERE id=?")
+                            .bind(&id)
+                            .fetch_optional(&mut *db)
+                            .await?;
+
                     if current != Some(revision) {
                         return Err(epistle_store::Error::Conflict("stale_oauth_callback"));
                     }
                     sqlx::query("UPDATE credentials SET ciphertext=?,access_expires_at=?,refresh_expires_at=?,scopes=?,updated_at=? WHERE account_id=?")
-                        .bind(sealed).bind(access_exp).bind(refresh_exp).bind(scopes).bind(now()).bind(&id)
-                        .execute(&mut *db).await?;
+                        .bind(sealed)
+                        .bind(access_exp)
+                        .bind(refresh_exp)
+                        .bind(scopes)
+                        .bind(now())
+                        .bind(&id)
+                        .execute(&mut *db)
+                        .await?;
                     sqlx::query("UPDATE accounts SET revision=revision+1,enabled=1 WHERE id=?")
                         .bind(&id)
                         .execute(&mut *db)
@@ -611,10 +703,12 @@ account_id,encrypted_verifier,revision
                     epistle_store::status_tx(db, &id, "connecting", None, 0).await
                 })
             })
-            .await.map_err(|e| match e {
+            .await
+            .map_err(|e| match e {
                 epistle_store::Error::Conflict("stale_oauth_callback") => Error::State,
                 other => Error::Store(other),
             })?;
+
         Ok(a.id)
     }
 }
@@ -645,6 +739,7 @@ mod tests {
             refresh_at: c.refresh_at(),
             password: false,
         };
+
         for id in ["a", "z", "0"] {
             assert_eq!(access.recycle_at(id), 1011);
         }
@@ -653,6 +748,7 @@ mod tests {
         c.access_issued_at = None;
         assert_eq!(c.refresh_at(), 4300);
     }
+
     #[test]
     fn envelope_encryption_binds_account_and_detects_tampering() {
         let vault = Vault::new(&"01".repeat(32)).unwrap();

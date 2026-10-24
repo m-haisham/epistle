@@ -1,3 +1,5 @@
+//! Durable files and signed, retryable webhook delivery.
+
 use epistle_core::{Config, FileManifest, Message, backoff, hash, id, now};
 use epistle_store::Store;
 use hmac::{Hmac, KeyInit, Mac};
@@ -11,6 +13,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("file storage failed")]
@@ -28,6 +31,8 @@ pub enum Error {
     #[error("file worker stopped")]
     Join(#[from] tokio::task::JoinError),
 }
+
+/// Extracted file bytes awaiting durable storage.
 pub struct FileDraft {
     pub role: String,
     pub filename: String,
@@ -38,27 +43,38 @@ pub struct FileDraft {
     pub content_location: Option<String>,
     pub bytes: Vec<u8>,
 }
+
+/// File manifest paired with its internal storage path.
 #[derive(Clone)]
 pub struct StoredFile {
     pub manifest: FileManifest,
     pub path: String,
 }
+
+/// Durable payload and files ready for transactional handoff.
 pub struct Prepared {
     pub message: Message,
     pub files: Vec<StoredFile>,
     pub payload_path: String,
     pub payload_size: i64,
 }
+
+/// Immutable message files and their retention lifecycle.
 #[derive(Clone)]
 pub struct FileStore {
     root: PathBuf,
 }
+
 impl FileStore {
+    /// Uses the message-file directory beneath the service data directory.
     pub fn new(data: &Path) -> Self {
         Self {
             root: data.join("files"),
         }
     }
+
+    /// Flushes immutable payload and file bytes before database handoff.
+    #[tracing::instrument(skip_all, fields(message_id = %message.id))]
     pub async fn prepare(
         &self,
         mut message: Message,
@@ -71,6 +87,7 @@ impl FileStore {
             let dir = root.join(&message.id).join(id());
             std::fs::create_dir_all(&dir)?;
             let mut files = vec![];
+
             for d in drafts {
                 let fid = id();
                 let path = dir.join(&fid);
@@ -93,6 +110,7 @@ impl FileStore {
                     path: path.to_string_lossy().into_owned(),
                 });
             }
+
             let event = serde_json::json!({
                 "id":id(),
                 "kind":"email.message.received",
@@ -106,6 +124,7 @@ impl FileStore {
             std::fs::File::open(&dir)?.sync_all()?;
             std::fs::File::open(root.join(&message.id))?.sync_all()?;
             std::fs::File::open(&root)?.sync_all()?;
+
             Ok(Prepared {
                 message,
                 files,
@@ -115,9 +134,12 @@ impl FileStore {
         })
         .await?
     }
+
+    /// Expires eligible files and removes startup orphans.
     pub async fn sweep(&self, store: &Store, config: &Config, startup: bool) -> Result<(), Error> {
         tokio::fs::create_dir_all(&self.root).await?;
         let pressure = fs2::available_space(&self.root)? < config.disk_reserve_bytes;
+
         let rows = sqlx::query(
             "
 SELECT file_id,path FROM message_files WHERE expired=0 AND expires_at IS NOT NULL AND
@@ -129,6 +151,7 @@ outbox.message_key=message_files.message_key)
         .bind(pressure)
         .fetch_all(&store.reads)
         .await?;
+
         for row in rows {
             let fid: String = row.try_get("file_id")?;
             let path: String = row.try_get("path")?;
@@ -137,9 +160,12 @@ outbox.message_key=message_files.message_key)
                     Box::pin(async move {
                         let changed = sqlx::query("UPDATE message_files SET expired=1 WHERE file_id=? AND expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_files.message_key)")
                             .bind(fid)
-                            .bind(now()).bind(pressure)
+                            .bind(now())
+                            .bind(pressure)
                             .execute(c)
-                            .await?.rows_affected();
+                            .await?
+                            .rows_affected();
+
                         Ok(changed > 0)
                     })
                 })
@@ -150,6 +176,7 @@ outbox.message_key=message_files.message_key)
                 remove_if_exists(&path).await?;
             }
         }
+
         let rows = sqlx::query(
             "
 SELECT id,payload_path FROM messages WHERE expired=0 AND expires_at IS NOT NULL AND
@@ -161,6 +188,7 @@ outbox.message_key=messages.id)
         .bind(pressure)
         .fetch_all(&store.reads)
         .await?;
+
         for row in rows {
             let mid: String = row.try_get("id")?;
             let path: String = row.try_get("payload_path")?;
@@ -170,17 +198,23 @@ outbox.message_key=messages.id)
                     Box::pin(async move {
                         let changed = sqlx::query("UPDATE messages SET expired=1 WHERE id=? AND payload_path=? AND expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=messages.id)")
                             .bind(mid)
-                            .bind(stored_path).bind(now()).bind(pressure)
+                            .bind(stored_path)
+                            .bind(now())
+                            .bind(pressure)
                             .execute(c)
-                            .await?.rows_affected();
+                            .await?
+                            .rows_affected();
+
                         Ok(changed > 0)
                     })
                 })
                 .await?;
+
             if expired {
                 remove_if_exists(&path).await?;
             }
         }
+
         let payloads = sqlx::query(
             "
 SELECT path FROM message_payloads WHERE expired=0 AND expires_at IS NOT NULL AND
@@ -192,6 +226,7 @@ outbox.message_key=message_payloads.message_key)
         .bind(pressure)
         .fetch_all(&store.reads)
         .await?;
+
         for row in payloads {
             let path: String = row.try_get("path")?;
             let stored_path = path.clone();
@@ -199,17 +234,23 @@ outbox.message_key=message_payloads.message_key)
                 .write(move |c| {
                     Box::pin(async move {
                         let changed = sqlx::query("UPDATE message_payloads SET expired=1 WHERE path=? AND expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_payloads.message_key)")
-                            .bind(stored_path).bind(now()).bind(pressure)
+                            .bind(stored_path)
+                            .bind(now())
+                            .bind(pressure)
                             .execute(c)
-                            .await?.rows_affected();
+                            .await?
+                            .rows_affected();
+
                         Ok(changed > 0)
                     })
                 })
                 .await?;
+
             if expired {
                 remove_if_exists(&path).await?;
             }
         }
+
         let cutoff = now() - config.index_retention_secs;
         store
             .write(move |c| {
@@ -229,10 +270,12 @@ NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_index.message_k
                         .bind(now())
                         .execute(c)
                         .await?;
+
                     Ok(())
                 })
             })
             .await?;
+
         if startup {
             let rows: Vec<String> = sqlx::query_scalar(
                 "
@@ -247,9 +290,11 @@ UNION SELECT payload_path FROM messages WHERE expired=0
             let root = self.root.clone();
             tokio::task::spawn_blocking(move || sweep_orphans(&root, &keep)).await??;
         }
+
         Ok(())
     }
 }
+
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -259,12 +304,15 @@ fn durable_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     file.write_all(bytes)?;
     file.sync_all()
 }
+
 fn sweep_orphans(dir: &Path, keep: &HashSet<String>) -> Result<(), std::io::Error> {
     for entry in std::fs::read_dir(dir)? {
         let e = entry?;
         let path = e.path();
+
         if e.file_type()?.is_dir() {
             sweep_orphans(&path, keep)?;
+
             if std::fs::read_dir(&path)?.next().is_none() {
                 std::fs::remove_dir(path)?;
             }
@@ -272,8 +320,10 @@ fn sweep_orphans(dir: &Path, keep: &HashSet<String>) -> Result<(), std::io::Erro
             std::fs::remove_file(path)?;
         }
     }
+
     Ok(())
 }
+
 async fn remove_if_exists(path: &str) -> Result<(), std::io::Error> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
@@ -281,13 +331,18 @@ async fn remove_if_exists(path: &str) -> Result<(), std::io::Error> {
         Err(e) => Err(e),
     }
 }
+
+/// Signs the timestamp and exact webhook body bytes.
 pub fn signature(secret: &str, timestamp: i64, body: &[u8]) -> Result<String, Error> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| Error::Signing)?;
     mac.update(timestamp.to_string().as_bytes());
     mac.update(b".");
     mac.update(body);
+
     Ok(format!("v1={}", hex::encode(mac.finalize().into_bytes())))
 }
+
+/// Checks a webhook signature and its timestamp tolerance.
 pub fn verify_signature(
     secret: &str,
     timestamp: i64,
@@ -299,27 +354,34 @@ pub fn verify_signature(
     if (i128::from(at) - i128::from(timestamp)).unsigned_abs() > tolerance.max(0) as u128 {
         return false;
     }
+
     let Some(raw) = signature
         .strip_prefix("v1=")
         .and_then(|s| hex::decode(s).ok())
     else {
         return false;
     };
+
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
+
     mac.update(timestamp.to_string().as_bytes());
     mac.update(b".");
     mac.update(body);
     mac.verify_slice(&raw).is_ok()
 }
+
+/// Signed webhook delivery with persisted retries.
 #[derive(Clone)]
 pub struct Delivery {
     store: Store,
     config: Arc<Config>,
     client: reqwest::Client,
 }
+
 impl Delivery {
+    /// Builds a bounded HTTP client without redirecting signed requests.
     pub fn new(store: Store, config: Arc<Config>) -> Result<Self, Error> {
         Ok(Self {
             store,
@@ -330,6 +392,9 @@ impl Delivery {
                 .build()?,
         })
     }
+
+    /// Delivers one batch and commits every independent outcome.
+    #[tracing::instrument(skip_all, name = "delivery_batch")]
     pub async fn tick(&self) -> Result<usize, Error> {
         let rows = sqlx::query(
             "
@@ -343,9 +408,12 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
         .await?;
         let count = rows.len();
         let mut tasks = tokio::task::JoinSet::new();
+
         for row in rows {
             let worker = self.clone();
-            tasks.spawn(async move { worker.deliver(row).await });
+            tasks.spawn(tracing::Instrument::in_current_span(async move {
+                worker.deliver(row).await
+            }));
         }
         // Drain every independent delivery even when one fails to commit. Dropping
         // the JoinSet here would abort unrelated requests after remote acceptance.
@@ -358,10 +426,14 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
         if let Some(error) = failure {
             return Err(error);
         }
+
         Ok(count)
     }
+
+    #[tracing::instrument(skip_all, fields(delivery_id = tracing::field::Empty))]
     async fn deliver(&self, row: sqlx::sqlite::SqliteRow) -> Result<(), Error> {
         let seq: i64 = row.try_get("seq")?;
+        tracing::Span::current().record("delivery_id", seq);
         let key: String = row.try_get("idempotency_key")?;
         let message_key: String = row.try_get("message_key")?;
         let body = if let Some(p) = row.try_get::<Option<String>, _>("payload")? {
@@ -383,12 +455,14 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
                         None,
                     )
                     .await?;
+
                     return Ok(());
                 }
             }
         };
         let timestamp = now();
         let sig = signature(&self.config.webhook_secret, timestamp, &body)?;
+
         let response = self
             .client
             .post(&self.config.webhook_url)
@@ -401,6 +475,7 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
             .send()
             .await;
         let status = response.as_ref().ok().map(|r| r.status().as_u16());
+
         if status.is_some_and(|s| (200..300).contains(&s)) {
             let retention = self.config.file_retention_secs;
             let backfill_id: Option<String> = row.try_get("backfill_id")?;
@@ -446,6 +521,7 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
                         .bind(&message_key)
                         .execute(&mut *c)
                         .await?;
+
                         if let Some(job) = backfill_id {
                             sqlx::query(
                                 "UPDATE backfill_jobs SET delivered=delivered+1 WHERE id=?",
@@ -454,10 +530,12 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
                             .execute(&mut *c)
                             .await?;
                         }
+
                         Ok(())
                     })
                 })
                 .await?;
+            tracing::debug!("webhook acknowledged and committed");
         } else {
             let attempts = row.try_get::<i64, _>("attempts")? + 1;
             let retryable = status.is_none_or(|s| s >= 500 || s == 408 || s == 429);
@@ -474,8 +552,10 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
             self.fail_delivery(seq, attempts, reason, retryable, delay)
                 .await?;
         }
+
         Ok(())
     }
+
     async fn fail_delivery(
         &self,
         seq: i64,
@@ -486,25 +566,57 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
     ) -> Result<(), Error> {
         let dead = !retryable || attempts >= self.config.max_attempts;
         let delay = delay.unwrap_or_else(|| backoff(attempts));
-        self.store.write(move |c| Box::pin(async move {
-            sqlx::query("UPDATE outbox SET state=?,attempts=?,next_attempt_at=?,last_error=? WHERE seq=?")
-                .bind(if dead { "dead" } else { "pending" }).bind(attempts)
-                .bind(now() + delay).bind(reason).bind(seq).execute(c).await?;
-            Ok(())
-        })).await?;
+        tracing::warn!(
+            delivery_id = seq,
+            attempts,
+            reason,
+            dead,
+            retry_delay_secs = delay,
+            "webhook delivery failed"
+        );
+        self.store
+            .write(move |c| {
+                Box::pin(async move {
+                    sqlx::query("UPDATE outbox SET state=?,attempts=?,next_attempt_at=?,last_error=? WHERE seq=?")
+                        .bind(if dead { "dead" } else { "pending" })
+                        .bind(attempts)
+                        .bind(now() + delay)
+                        .bind(reason)
+                        .bind(seq)
+                        .execute(c)
+                        .await?;
+
+                    Ok(())
+                })
+            })
+            .await?;
+
         if dead {
             tracing::error!(
                 delivery_id = seq,
                 "webhook delivery dead; replay or discard required"
             );
         }
+
         Ok(())
     }
+
+    /// Drains the current delivery batch before honoring cancellation.
     pub async fn run(self, cancel: CancellationToken) {
         loop {
-            tokio::select! {_ = cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{if let Err(e)=self.tick().await{tracing::error!(error=%e,"delivery tick failed");
-            }}}
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+
+            // Complete the whole batch, including durable acknowledgments.
+            if let Err(error) = self.tick().await {
+                tracing::error!(%error, "delivery tick failed");
+            }
         }
+
+        tracing::info!("delivery worker stopped");
     }
 }
 

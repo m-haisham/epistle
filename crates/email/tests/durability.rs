@@ -1,3 +1,5 @@
+//! Transaction, delivery and file lifecycle regressions.
+
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[path = "../../../tests/support/mod.rs"]
 mod support;
@@ -9,6 +11,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU16, Ordering},
 };
+
 fn pointer() -> Pointer {
     Pointer {
         account_id: "a".into(),
@@ -25,6 +28,7 @@ fn pointer() -> Pointer {
         internal_date: epistle_core::now(),
     }
 }
+
 async fn fixture() -> (tempfile::TempDir, Store, FileStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
@@ -45,6 +49,7 @@ async fn fixture() -> (tempfile::TempDir, Store, FileStore) {
     let files = FileStore::new(dir.path());
     (dir, store, files)
 }
+
 async fn discover(store: &Store, redeliver: bool) {
     store
         .write(move |c| {
@@ -59,6 +64,7 @@ async fn discover(store: &Store, redeliver: bool) {
         .await
         .unwrap();
 }
+
 async fn prepare(store: &Store, files: &FileStore) -> (String, epistle_delivery::Prepared) {
     use sqlx::Row;
     let row = sqlx::query("SELECT id,message_key,idempotency_key FROM fetch_queue LIMIT 1")
@@ -81,6 +87,7 @@ async fn prepare(store: &Store, files: &FileStore) -> (String, epistle_delivery:
             .unwrap(),
     )
 }
+
 async fn count(store: &Store, table: &str) -> i64 {
     sqlx::query_scalar(match table {
         "fetch_queue" => "SELECT COUNT(*) FROM fetch_queue",
@@ -96,6 +103,7 @@ async fn count(store: &Store, table: &str) -> i64 {
     .await
     .unwrap()
 }
+
 #[tokio::test]
 async fn crash_boundaries_preserve_stub_and_remove_orphan_files() {
     let (dir, store, files) = fixture().await;
@@ -180,6 +188,7 @@ crash'); END
         .unwrap();
     assert_eq!(count(&restarted, "message_index").await, 1);
 }
+
 #[tokio::test]
 async fn dead_and_retrying_deliveries_retain_files_ack_starts_expiry() {
     let (dir, store, files) = fixture().await;
@@ -403,10 +412,15 @@ async fn failed_ack_does_not_cancel_slow_independent_delivery() {
     let (stub, prepared) = prepare(&store, &files).await;
     handoff(&store, stub, prepared).await.unwrap();
     store.status("a", "active", None, 0).await.unwrap();
-    store.write(|c| Box::pin(async move {
-        sqlx::query("CREATE TRIGGER fail_message_ack BEFORE DELETE ON outbox WHEN OLD.kind='email.message.received' BEGIN SELECT RAISE(ABORT,'injected'); END").execute(c).await?;
-        Ok(())
-    })).await.unwrap();
+    store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query("CREATE TRIGGER fail_message_ack BEFORE DELETE ON outbox WHEN OLD.kind='email.message.received' BEGIN SELECT RAISE(ABORT,'injected'); END").execute(c).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     let app = axum::Router::new().route(
         "/webhook",
         axum::routing::post(
@@ -446,12 +460,20 @@ async fn pressure_eviction_commits_tombstone_before_unlink_and_restart_cleans_or
     let (stub, prepared) = prepare(&store, &files).await;
     let path = prepared.files.first().unwrap().path.clone();
     handoff(&store, stub, prepared).await.unwrap();
-    store.write(|c| Box::pin(async move {
-        sqlx::query("DELETE FROM outbox").execute(&mut *c).await?;
-        sqlx::query("UPDATE message_files SET expires_at=?").bind(epistle_core::now()+3600).execute(&mut *c).await?;
-        sqlx::query("CREATE TRIGGER fail_expiry BEFORE UPDATE OF expired ON message_files BEGIN SELECT RAISE(ABORT,'injected expiry crash'); END").execute(c).await?;
-        Ok(())
-    })).await.unwrap();
+    store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM outbox").execute(&mut *c).await?;
+                sqlx::query("UPDATE message_files SET expires_at=?")
+                    .bind(epistle_core::now() + 3600)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("CREATE TRIGGER fail_expiry BEFORE UPDATE OF expired ON message_files BEGIN SELECT RAISE(ABORT,'injected expiry crash'); END").execute(c).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     let mut config = support::config(dir.path());
     config.disk_reserve_bytes = u64::MAX;
     assert!(files.sweep(&store, &config, false).await.is_err());
@@ -488,4 +510,63 @@ async fn pressure_eviction_commits_tombstone_before_unlink_and_restart_cleans_or
         .await
         .unwrap();
     assert!(expired);
+}
+
+#[tokio::test]
+async fn graceful_delivery_stop_commits_ack_and_preserves_the_next_event() {
+    use axum::{Router, routing::post};
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+
+    let (dir, store, _) = fixture().await;
+    store.status("a", "connecting", None, 0).await.unwrap();
+    store.status("a", "active", None, 0).await.unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let arrived = entered.clone();
+    let gate = release.clone();
+    let router = Router::new().route(
+        "/",
+        post(move || {
+            let arrived = arrived.clone();
+            let gate = gate.clone();
+            async move {
+                arrived.notify_one();
+                gate.notified().await;
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = support::config(dir.path());
+    config.webhook_url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let delivery = Delivery::new(store.clone(), Arc::new(config)).unwrap();
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(delivery.run(stop.clone()));
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+
+    stop.cancel();
+    assert!(!worker.is_finished());
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count(&store, "outbox").await, 1);
+    let body: String = sqlx::query_scalar("SELECT payload FROM outbox")
+        .fetch_one(&store.reads)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body)
+            .unwrap()
+            .get("status")
+            .and_then(|value| value.as_str()),
+        Some("active")
+    );
+    store.close().await.unwrap();
+    server.abort();
 }
