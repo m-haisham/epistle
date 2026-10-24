@@ -438,3 +438,54 @@ async fn failed_ack_does_not_cancel_slow_independent_delivery() {
     assert_eq!(kinds, ["email.message.received"]);
     server.abort();
 }
+
+#[tokio::test]
+async fn pressure_eviction_commits_tombstone_before_unlink_and_restart_cleans_orphans() {
+    let (dir, store, files) = fixture().await;
+    discover(&store, false).await;
+    let (stub, prepared) = prepare(&store, &files).await;
+    let path = prepared.files.first().unwrap().path.clone();
+    handoff(&store, stub, prepared).await.unwrap();
+    store.write(|c| Box::pin(async move {
+        sqlx::query("DELETE FROM outbox").execute(&mut *c).await?;
+        sqlx::query("UPDATE message_files SET expires_at=?").bind(epistle_core::now()+3600).execute(&mut *c).await?;
+        sqlx::query("CREATE TRIGGER fail_expiry BEFORE UPDATE OF expired ON message_files BEGIN SELECT RAISE(ABORT,'injected expiry crash'); END").execute(c).await?;
+        Ok(())
+    })).await.unwrap();
+    let mut config = support::config(dir.path());
+    config.disk_reserve_bytes = u64::MAX;
+    assert!(files.sweep(&store, &config, false).await.is_err());
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "failed marker transaction must not remove the retained file"
+    );
+    let expired: bool = sqlx::query_scalar("SELECT expired FROM message_files LIMIT 1")
+        .fetch_one(&store.reads)
+        .await
+        .unwrap();
+    assert!(!expired);
+    // Simulate a crash immediately after the tombstone commit, before unlink.
+    store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query("DROP TRIGGER fail_expiry")
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("UPDATE message_files SET expired=1")
+                    .execute(c)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    config.disk_reserve_bytes = 0;
+    let restarted = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
+    files.sweep(&restarted, &config, true).await.unwrap();
+    assert!(!std::path::Path::new(&path).exists());
+    let expired: bool = sqlx::query_scalar("SELECT expired FROM message_files LIMIT 1")
+        .fetch_one(&restarted.reads)
+        .await
+        .unwrap();
+    assert!(expired);
+}

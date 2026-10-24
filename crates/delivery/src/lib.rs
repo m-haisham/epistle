@@ -132,18 +132,23 @@ outbox.message_key=message_files.message_key)
         for row in rows {
             let fid: String = row.try_get("file_id")?;
             let path: String = row.try_get("path")?;
-            remove_if_exists(&path).await?;
-            store
+            let expired = store
                 .write(move |c| {
                     Box::pin(async move {
-                        sqlx::query("UPDATE message_files SET expired=1 WHERE file_id=?")
+                        let changed = sqlx::query("UPDATE message_files SET expired=1 WHERE file_id=? AND expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_files.message_key)")
                             .bind(fid)
+                            .bind(now()).bind(pressure)
                             .execute(c)
-                            .await?;
-                        Ok(())
+                            .await?.rows_affected();
+                        Ok(changed > 0)
                     })
                 })
                 .await?;
+            // Commit the tombstone before unlinking. A crash leaves either a
+            // retained file, or an expired orphan removable at the next startup.
+            if expired {
+                remove_if_exists(&path).await?;
+            }
         }
         let rows = sqlx::query(
             "
@@ -159,19 +164,22 @@ outbox.message_key=messages.id)
         for row in rows {
             let mid: String = row.try_get("id")?;
             let path: String = row.try_get("payload_path")?;
-            remove_if_exists(&path).await?;
-            store
+            let stored_path = path.clone();
+            let expired = store
                 .write(move |c| {
                     Box::pin(async move {
-                        sqlx::query("UPDATE messages SET expired=1 WHERE id=? AND payload_path=?")
+                        let changed = sqlx::query("UPDATE messages SET expired=1 WHERE id=? AND payload_path=? AND expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=messages.id)")
                             .bind(mid)
-                            .bind(path)
+                            .bind(stored_path).bind(now()).bind(pressure)
                             .execute(c)
-                            .await?;
-                        Ok(())
+                            .await?.rows_affected();
+                        Ok(changed > 0)
                     })
                 })
                 .await?;
+            if expired {
+                remove_if_exists(&path).await?;
+            }
         }
         let payloads = sqlx::query(
             "
@@ -186,18 +194,21 @@ outbox.message_key=message_payloads.message_key)
         .await?;
         for row in payloads {
             let path: String = row.try_get("path")?;
-            remove_if_exists(&path).await?;
-            store
+            let stored_path = path.clone();
+            let expired = store
                 .write(move |c| {
                     Box::pin(async move {
-                        sqlx::query("UPDATE message_payloads SET expired=1 WHERE path=?")
-                            .bind(path)
+                        let changed = sqlx::query("UPDATE message_payloads SET expired=1 WHERE path=? AND expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_payloads.message_key)")
+                            .bind(stored_path).bind(now()).bind(pressure)
                             .execute(c)
-                            .await?;
-                        Ok(())
+                            .await?.rows_affected();
+                        Ok(changed > 0)
                     })
                 })
                 .await?;
+            if expired {
+                remove_if_exists(&path).await?;
+            }
         }
         let cutoff = now() - config.index_retention_secs;
         store

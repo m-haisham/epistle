@@ -80,6 +80,8 @@ Validate the signature in constant time, allow a small timestamp window (for exa
 
 Download and mirror files promptly. `GET /email/messages/{id}/files/{file_id}` supports a single byte range, suffix ranges, conditional ETags, content length and attachment disposition. Unknown IDs return 404. Expired or pressure-evicted files return 410, with tombstones retained. Unacknowledged and dead deliveries protect their files. Acknowledgment starts the configured retention window, including every payload generation from redelivery. Under disk pressure, only eligible retained/delivered generations are evicted.
 
+Cleanup commits the expired marker before removing a file. If the database write fails, the file remains available; if the process crashes after the commit, startup orphan cleanup removes the leftover file.
+
 `GET /email/messages/{id}` returns the message inside the webhook. Its body expires with the files and then returns 410; this is a temporary store. Message lookup pointers remain available for read commands for 30 days. The `seen` ledger keeps cross-folder and epoch-reset deduplication identities beyond file expiry.
 
 ## Account and queue operations

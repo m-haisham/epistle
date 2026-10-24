@@ -327,7 +327,10 @@ impl Connection {
         Ok(self
             .checked(format!("UID FETCH {ids} {query}"))
             .await?
-            .fetches)
+            .fetches
+            .into_iter()
+            .filter(|f| f.uid.is_some_and(|uid| requested_uid(ids, uid)))
+            .collect())
     }
     pub async fn metadata(
         &mut self,
@@ -345,6 +348,9 @@ impl Connection {
         let fetched = self.fetch_data(ids, query).await?;
         Ok(fetched
             .into_iter()
+            // Unsolicited FLAGS/MODSEQ updates are not discovery records, even
+            // when they happen to name one of the requested UIDs.
+            .filter(|f| f.has_envelope)
             .filter_map(|f| {
                 Some(Pointer {
                     account_id: a.id.clone(),
@@ -497,6 +503,7 @@ struct Fetched {
     size: i64,
     internal_date: i64,
     message_id: Option<String>,
+    has_envelope: bool,
     gmail_id: Option<String>,
     thread_id: Option<String>,
     labels: Vec<String>,
@@ -517,6 +524,7 @@ impl From<&[AttributeValue<'_>]> for Fetched {
                             .unwrap_or(0)
                 }
                 AttributeValue::Envelope(e) => {
+                    result.has_envelope = true;
                     result.message_id = e
                         .message_id
                         .as_ref()
@@ -541,6 +549,26 @@ impl From<&[AttributeValue<'_>]> for Fetched {
         }
         result
     }
+}
+
+fn requested_uid(set: &str, uid: u32) -> bool {
+    let bound = |value: &str| {
+        if value == "*" {
+            Some(u32::MAX)
+        } else {
+            value.parse::<u32>().ok()
+        }
+    };
+    set.split(',').any(|part| {
+        if let Some((a, b)) = part.split_once(':') {
+            match (bound(a), bound(b)) {
+                (Some(a), Some(b)) => (a.min(b)..=a.max(b)).contains(&uid),
+                _ => false,
+            }
+        } else {
+            bound(part) == Some(uid)
+        }
+    })
 }
 
 #[cfg(test)]

@@ -326,3 +326,46 @@ async fn rejected_commands_never_expose_partial_results_or_success() {
         }
     }
 }
+
+#[tokio::test]
+async fn metadata_ignores_unsolicited_uids_and_flag_only_updates() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = account(listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"* OK ready\r\n").await.unwrap();
+        let mut io = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            if io.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let tag = line.split_whitespace().next().unwrap();
+            let data = if line.contains(" CAPABILITY") {
+                "* CAPABILITY IMAP4rev1\r\n"
+            } else if line.contains("UID FETCH") {
+                "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n* 2 FETCH (UID 9 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL \"<other@example.test>\"))\r\n* 1 FETCH (UID 1 FLAGS (\\Seen) RFC822.SIZE 10 INTERNALDATE \"24-Oct-2026 12:00:00 +0000\" ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL \"<target@example.test>\"))\r\n"
+            } else {
+                ""
+            };
+            io.get_mut()
+                .write_all(format!("{data}{tag} OK done\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let mut conn = Connection::connect(&a, "secret".into(), true, 2)
+        .await
+        .unwrap();
+    let records = conn.metadata(&a, "f", "INBOX", 1, "1").await.unwrap();
+    assert_eq!(records.len(), 1);
+    let record = records.first().unwrap();
+    assert_eq!(record.uid, 1);
+    assert_eq!(
+        record.rfc_message_id.as_deref(),
+        Some("<target@example.test>")
+    );
+    assert_eq!(record.flags, ["\\Seen"]);
+    drop(conn);
+    server.await.unwrap();
+}
