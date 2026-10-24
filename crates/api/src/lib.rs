@@ -396,7 +396,7 @@ async fn update_credentials(
             Box::pin(async move {
                 sqlx::query(
                     "
-UPDATE credentials SET ciphertext=?,access_expires_at=NULL,scopes='[]',updated_at=?
+UPDATE credentials SET ciphertext=?,access_expires_at=NULL,refresh_expires_at=NULL,scopes='[]',updated_at=?
 WHERE account_id=?
 ",
                 )
@@ -880,7 +880,14 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
         .bind(&a.id)
         .fetch_one(&s.store.reads)
         .await?;
-        account_health.push(json!({"id":a.id,"status":a.status,"last_success_at":a.last_success_at,"lag_seconds":oldest.map(|t|now()-t).unwrap_or(0)}));
+        let refresh_expires_at = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT refresh_expires_at FROM credentials WHERE account_id=?",
+        )
+        .bind(&a.id)
+        .fetch_optional(&s.store.reads)
+        .await?
+        .flatten();
+        account_health.push(json!({"id":a.id,"status":a.status,"last_success_at":a.last_success_at,"lag_seconds":oldest.map(|t|now()-t).unwrap_or(0),"refresh_token_expires_at":refresh_expires_at}));
     }
     let dead_fetch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fetch_queue WHERE state='dead'")
         .fetch_one(&s.store.reads)

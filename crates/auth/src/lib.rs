@@ -39,6 +39,7 @@ pub enum Error {
 pub struct Credentials {
     pub password: Option<String>,
     pub refresh_token: Option<String>,
+    pub refresh_token_expires_at: Option<i64>,
     pub access_token: Option<String>,
     pub access_expires_at: Option<i64>,
     pub access_issued_at: Option<i64>,
@@ -136,6 +137,8 @@ pub struct TokenProvider {
     config: Arc<Config>,
     client: reqwest::Client,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    #[cfg(test)]
+    refresh_save_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
 pub struct Access {
     pub secret: SecretString,
@@ -168,6 +171,7 @@ impl Credentials {
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    refresh_token_expires_in: Option<u64>,
     expires_in: Option<i64>,
     scope: Option<String>,
 }
@@ -185,6 +189,8 @@ impl TokenProvider {
             config,
             client,
             locks: Default::default(),
+            #[cfg(test)]
+            refresh_save_gate: None,
         })
     }
     pub async fn lock(&self, a: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -220,13 +226,14 @@ impl TokenProvider {
         let sealed = self.encrypt_credentials(a, c)?;
         let a = a.to_owned();
         let exp = c.access_expires_at;
+        let refresh_exp = c.refresh_token_expires_at;
         let scopes = serde_json::to_string(&c.scopes).map_err(|_| Error::Data)?;
         self.store.write(move |db|Box::pin(async move { sqlx::query("
-INSERT INTO credentials(account_id,ciphertext,access_expires_at,scopes,updated_at)
-VALUES(?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
-ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scopes=excluded.scopes,updated_at=excluded.updated_at
+INSERT INTO credentials(account_id,ciphertext,access_expires_at,refresh_expires_at,scopes,updated_at)
+VALUES(?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
+ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refresh_expires_at=excluded.refresh_expires_at,scopes=excluded.scopes,updated_at=excluded.updated_at
 ")
-   .bind(a).bind(sealed).bind(exp).bind(scopes).bind(now()).execute(db).await?;
+   .bind(a).bind(sealed).bind(exp).bind(refresh_exp).bind(scopes).bind(now()).execute(db).await?;
  Ok(()) })).await?;
         Ok(())
     }
@@ -255,6 +262,12 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scop
                 refresh_at: c.refresh_at(),
                 password: false,
             });
+        }
+        if a.auth_kind.oauth()
+            && c.refresh_token_expires_at
+                .is_some_and(|expiry| expiry <= now())
+        {
+            return Err(Error::Reauth("refresh_token_expired"));
         }
         let endpoint = self.endpoint(a);
         let form = if a.auth_kind == AuthKind::GoogleServiceAccount {
@@ -308,6 +321,13 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scop
         };
         let response = self.exchange(&endpoint, &form).await?;
         self.apply_response(a, &mut c, response, false)?;
+        // The process-crash tests stop here, after a successful provider exchange
+        // and before any local persistence. No fault hooks exist in release builds.
+        #[cfg(test)]
+        if let Some(gate) = &self.refresh_save_gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
         self.save(&a.id, &c).await?;
         // A rotated refresh token is durable before the access token leaves this function.
         Ok(Access {
@@ -378,7 +398,11 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scop
                 _ => Error::Reauth("credentials_rejected"),
             });
         }
-        response.json().await.map_err(|_| Error::Data)
+        // A provider may have processed the refresh even when its response is
+        // truncated/lost. Retry the durable token through the supervisor's backoff;
+        // Google reuses it and Microsoft does not revoke it merely on refresh.
+        // Do not park the account as invalid local configuration on a transport error.
+        response.json().await.map_err(|_| Error::Temporary)
     }
     fn apply_response(
         &self,
@@ -407,6 +431,17 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scop
         let issued = now();
         c.access_issued_at = Some(issued);
         c.access_expires_at = Some(issued + r.expires_in.unwrap_or(3600).clamp(1, 86400));
+        if let Some(remaining) = r.refresh_token_expires_in {
+            c.refresh_token_expires_at = Some(
+                issued
+                    .checked_add(i64::try_from(remaining).map_err(|_| Error::Temporary)?)
+                    .ok_or(Error::Temporary)?,
+            );
+        } else if require_scope && r.refresh_token.is_some() {
+            // New consent can grant a new lifetime. Normal access-token refresh
+            // (including rotation) must never silently extend a known deadline.
+            c.refresh_token_expires_at = None;
+        }
         if let Some(token) = r.refresh_token {
             c.refresh_token = Some(token);
         }
@@ -566,6 +601,9 @@ account_id,encrypted_verifier,revision
         Ok(a.id)
     }
 }
+
+#[cfg(test)]
+mod crash_tests;
 
 #[cfg(test)]
 mod tests {
