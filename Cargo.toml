@@ -1,0 +1,63 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+epistle-core = { path = "crates/core" }
+epistle-store = { path = "crates/store" }
+epistle-auth = { path = "crates/auth" }
+epistle-imap = { path = "crates/imap" }
+epistle-email = { path = "crates/email" }
+epistle-delivery = { path = "crates/delivery" }
+epistle-api = { path = "crates/api" }
+aide = { version = "0.15.1", features = ["axum", "axum-json", "axum-query"] }
+axum = { version = "0.8.9", features = ["macros"] }
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
+config = { version = "0.15.27", default-features = false, features = ["toml"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+fs2 = "0.4.3"
+futures = "0.3.31"
+hex = "0.4.3"
+imap-proto = "0.17.0"
+hmac = "0.13.0"
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+mail-parser = "1.0.0"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "form", "rustls"] }
+schemars = { version = "0.9.0", features = ["chrono04"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2.6.1"
+thiserror = "2.0.17"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-rustls = "0.26.6"
+tokio-util = { version = "0.7.16", features = ["io", "rt"] }
+tower = { version = "0.5.2", features = ["util"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+url = "2.5.7"
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+webpki-roots = "1.0.11"
+zeroize = { version = "1.8.2", features = ["derive"] }
+tempfile = "3.23.0"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+indexing_slicing = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

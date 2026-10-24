@@ -1,0 +1,27 @@
+[package]
+name = "epistle-delivery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+epistle-core.workspace = true
+epistle-store.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

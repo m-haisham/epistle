@@ -1,0 +1,28 @@
+[package]
+name = "epistle-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+epistle-core.workspace = true
+epistle-store.workspace = true
+epistle-auth.workspace = true
+epistle-email.workspace = true
+epistle-delivery.workspace = true
+epistle-api.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+fs2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true
+secrecy.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

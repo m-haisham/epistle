@@ -1,0 +1,31 @@
+[package]
+name = "epistle-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+epistle-core.workspace = true
+epistle-store.workspace = true
+epistle-auth.workspace = true
+epistle-delivery.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+aide.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+subtle.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

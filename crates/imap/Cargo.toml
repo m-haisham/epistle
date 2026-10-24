@@ -1,0 +1,23 @@
+[package]
+name = "epistle-imap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+imap-proto.workspace = true
+epistle-core.workspace = true
+async-imap.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+secrecy.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

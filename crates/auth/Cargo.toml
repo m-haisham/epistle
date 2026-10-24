@@ -1,0 +1,31 @@
+[package]
+name = "epistle-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+epistle-core.workspace = true
+epistle-store.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+base64.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+jsonwebtoken.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
