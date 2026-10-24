@@ -8,6 +8,8 @@ state = {
     "issued_tokens": {}, "refresh_history": [], "token_failures": 0,
     "introspections": [],
     "refresh_expires_at": None,
+    "pause_tokens": False, "pause_webhooks": False,
+    "blocked_tokens": 0, "blocked_webhooks": 0,
 }
 lock = threading.Lock()
 class Handler(BaseHTTPRequestHandler):
@@ -28,6 +30,16 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404, {})
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        gate = {"/token": "tokens", "/webhook": "webhooks"}.get(self.path)
+        if gate:
+            with lock:
+                paused = state["pause_" + gate]
+                if paused:
+                    state["blocked_" + gate] += 1
+            while paused:
+                time.sleep(.02)
+                with lock:
+                    paused = state["pause_" + gate]
         with lock:
             if self.path == "/webhook":
                 state["events"].append({"headers": dict(self.headers), "body": json.loads(body), "raw": body.decode()})

@@ -63,6 +63,7 @@ python3 tests/integration.py
 docker compose build epistle
 python3 tests/token_expiry.py --image epistle-epistle:latest
 python3 tests/recovery.py --image epistle-epistle:latest
+python3 tests/shutdown.py --image epistle-epistle:latest
 cargo audit
 cargo deny check
 ```
@@ -70,6 +71,8 @@ cargo deny check
 Rust tests use loopback HTTP servers for token and delivery tests. The integration suite starts its own service on port 18080 with a temporary data directory and uses Dovecot on port 1143 and the mock on port 8090. It covers initial/live sync, attachments, signatures, ranges, read/unread, cross-folder dedupe, backfills, restart catch-up, UIDVALIDITY fallback, dead replay, real XOAUTH2, revoked-token recovery, encryption, retention, and ordered status events. The expiry suite tests both Google and Microsoft account strategies with 12-second tokens, a rotating refresh token that becomes invalid after use, natural reconnects, process crashes, provider disconnects, and temporary token-endpoint failures. It checks catch-up, deduplication, files, and commands after restart. Omit `--image` to test the host debug binary. Run the suites sequentially: they share the mock and port 18080. Auth unit tests also kill a child process precisely after token exchange and before persistence, then verify recovery using Google/Microsoft token-reuse rules. These tests also cover lost responses and refresh-token expiration; the strict single-use issuer is an additional adversarial model, not a claim about Google or Microsoft rotation. SQL transaction failures are injected at discovery, handoff, and delivery acknowledgment boundaries in Rust tests.
 
 The recovery suite covers missing-folder isolation, failed backfill targets, folder recreation, deleted-folder commands and the Scalar endpoint. See [the specification review](docs/spec-review.md) for the review findings, fixes and remaining scope boundaries.
+
+The shutdown suite sends SIGTERM during a paused OAuth exchange and SIGINT during a paused webhook response. It verifies credential persistence, acknowledgment draining and restart catch-up in both the host binary and distroless image. Rust tests also check pending fetches, commands and queued database transactions at shutdown boundaries.
 
 GitHub Actions runs the checks above, and Dependabot proposes weekly dependency updates. Duplicate transitive crate versions are reported by `cargo deny`; advisories, unapproved licenses, wildcard dependencies, and unknown sources fail the checks.
 

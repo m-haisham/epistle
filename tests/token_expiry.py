@@ -61,12 +61,13 @@ class Service:
         if self.process.poll() is not None:
             self.process.wait()
         elif self.image:
-            subprocess.run(["docker", "kill" if crash else "stop", self.name], check=True, capture_output=True)
+            command = ["docker", "kill", self.name] if crash else ["docker", "stop", "--time", "300", self.name]
+            subprocess.run(command, check=True, capture_output=True)
         elif crash:
             self.process.kill()
         else:
             self.process.terminate()
-        self.process.wait(timeout=15)
+        self.process.wait(timeout=330)
         self.process = None
 
     def close(self):

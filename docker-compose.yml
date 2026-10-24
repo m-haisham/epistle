@@ -13,6 +13,7 @@ services:
       - "127.0.0.1:8090:8090"
   epistle:
     build: .
+    stop_grace_period: 5m
     environment:
       BIND_ADDR: 0.0.0.0:8080
       API_KEY: local-test-api-key-0000000000000000

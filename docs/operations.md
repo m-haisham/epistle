@@ -16,7 +16,11 @@
 
 Keep SQLite and the file store on one local persistent volume. An OS lock prevents two processes owning the same data directory. An epoch checked inside every write transaction fences stale writers. The SQLx read pool is read-only; a bounded channel feeds one dedicated write connection. Migration checksums detect changed historical migrations.
 
-Stop the old instance before deploying a replacement. SIGTERM stops workers; restart resumes durable cursors and queues. Queue claims are in memory, so there are no persisted leases to clear. On startup, unreferenced file generations are removed. Database transactions and filesystem `fsync` make the file-to-outbox handoff recoverable.
+Stop the old instance before deploying a replacement. SIGTERM or SIGINT stops accepting HTTP connections and new worker work. Existing HTTP handlers, OAuth exchanges, message handoffs, read commands and webhook batches finish before the database writer drains and closes. The instance lock remains held until this completes. Idle sessions and backoff waits stop promptly; network operations retain their watchdogs. Shutdown does not forcibly abort work after a fixed timeout.
+
+Give the process enough time to drain: Compose allows five minutes, and manual container stops should use `docker stop --time 300`. Large file writes or slow clients can need longer. SIGKILL or an external stop deadline still bypasses graceful shutdown. Restart resumes durable cursors and queues; a remotely accepted webhook whose acknowledgment was not committed may be redelivered with the same idempotency key. Queue claims are in memory, so there are no persisted leases to clear. On startup, unreferenced file generations are removed. Database transactions and filesystem `fsync` make the file-to-outbox handoff recoverable.
+
+The server installs `tracing-subscriber` once. Set `RUST_LOG=info,epistle_email=debug,epistle_auth=debug` for account and token diagnostics. Structured spans correlate account IDs, worker roles, delivery IDs and HTTP request IDs. HTTP traces record route templates, status and latency, excluding query strings, headers and bodies. Application instrumentation skips credentials and message contents. The `shutdown complete` event confirms that workers and database writes drained.
 
 ## Authentication providers
 
