@@ -175,10 +175,10 @@ pub fn router(state: AppState) -> axum::Router {
             }
             if let Some(ops) = item.as_object_mut() {
                 for (method, op) in ops {
-                    if ["get", "post", "delete", "patch"].contains(&method.as_str()) {
-                        if let Some(op) = op.as_object_mut() {
-                            op.insert("security".into(), json!([{"apiKey":[]}]));
-                        }
+                    if ["get", "post", "delete", "patch"].contains(&method.as_str())
+                        && let Some(op) = op.as_object_mut()
+                    {
+                        op.insert("security".into(), json!([{"apiKey":[]}]));
                     }
                 }
             }
@@ -636,7 +636,7 @@ async fn replay(State(s): State<AppState>, Path(id): Path<i64>) -> Result<Status
 }
 async fn discard(State(s): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, ApiError> {
     let retention = s.config.file_retention_secs;
-    s.store.write(move|c|Box::pin(async move{let key:Option<String>=sqlx::query_scalar("DELETE FROM outbox WHERE seq=? AND state='dead' RETURNING message_key").bind(id).fetch_optional(&mut *c).await?;let key=key.ok_or(epistle_store::Error::Conflict("delivery_not_dead"))?;sqlx::query("UPDATE message_files SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(&key).execute(&mut *c).await?;sqlx::query("UPDATE messages SET expires_at=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(key).execute(c).await?;Ok(())})).await?;
+    s.store.write(move|c|Box::pin(async move{let key:Option<String>=sqlx::query_scalar("DELETE FROM outbox WHERE seq=? AND state='dead' RETURNING message_key").bind(id).fetch_optional(&mut *c).await?;let key=key.ok_or(epistle_store::Error::Conflict("delivery_not_dead"))?;sqlx::query("UPDATE message_files SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(&key).execute(&mut *c).await?;sqlx::query("UPDATE message_payloads SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(&key).execute(&mut *c).await?;sqlx::query("UPDATE messages SET expires_at=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(key).execute(c).await?;Ok(())})).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn health(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {

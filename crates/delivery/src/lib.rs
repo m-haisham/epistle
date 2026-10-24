@@ -119,13 +119,29 @@ impl FileStore {
                 })
                 .await?;
         }
+        let payloads=sqlx::query("SELECT path FROM message_payloads WHERE expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_payloads.message_key)").bind(now()).bind(pressure).fetch_all(&store.reads).await?;
+        for row in payloads {
+            let path: String = row.try_get("path")?;
+            remove_if_exists(&path).await?;
+            store
+                .write(move |c| {
+                    Box::pin(async move {
+                        sqlx::query("UPDATE message_payloads SET expired=1 WHERE path=?")
+                            .bind(path)
+                            .execute(c)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .await?;
+        }
         let cutoff = now() - config.index_retention_secs;
         store.write(move|c|Box::pin(async move{
    sqlx::query("DELETE FROM message_index WHERE created_at<? AND NOT EXISTS(SELECT 1 FROM fetch_queue WHERE fetch_queue.message_key=message_index.message_key) AND NOT EXISTS(SELECT 1 FROM commands WHERE commands.message_key=message_index.message_key AND state='pending') AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_index.message_key)").bind(cutoff).execute(&mut *c).await?;
    sqlx::query("DELETE FROM oauth_states WHERE expires_at<?").bind(now()).execute(c).await?;Ok(())
   })).await?;
         if startup {
-            let rows:Vec<String>=sqlx::query_scalar("SELECT path FROM message_files WHERE expired=0 UNION SELECT payload_path FROM outbox WHERE payload_path IS NOT NULL UNION SELECT payload_path FROM messages WHERE expired=0").fetch_all(&store.reads).await?;
+            let rows:Vec<String>=sqlx::query_scalar("SELECT path FROM message_files WHERE expired=0 UNION SELECT payload_path FROM outbox WHERE payload_path IS NOT NULL UNION SELECT path FROM message_payloads WHERE expired=0 UNION SELECT payload_path FROM messages WHERE expired=0").fetch_all(&store.reads).await?;
             let keep: HashSet<_> = rows.into_iter().collect();
             let root = self.root.clone();
             tokio::task::spawn_blocking(move || sweep_orphans(&root, &keep)).await??;
@@ -179,7 +195,7 @@ pub fn verify_signature(
     at: i64,
     tolerance: i64,
 ) -> bool {
-    if (at - timestamp).unsigned_abs() > tolerance.max(0) as u64 {
+    if (i128::from(at) - i128::from(timestamp)).unsigned_abs() > tolerance.max(0) as u128 {
         return false;
     }
     let Some(raw) = signature
@@ -256,6 +272,7 @@ impl Delivery {
     sqlx::query("DELETE FROM outbox WHERE seq=?").bind(seq).execute(&mut *c).await?;
     sqlx::query("UPDATE message_files SET delivered_at=COALESCE(delivered_at,?),expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()).bind(now()+retention).bind(&message_key).bind(&message_key).execute(&mut *c).await?;
     sqlx::query("UPDATE messages SET delivered_at=COALESCE(delivered_at,?),expires_at=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()).bind(now()+retention).bind(&message_key).bind(&message_key).execute(&mut *c).await?;
+    sqlx::query("UPDATE message_payloads SET expires_at=? WHERE message_key=? AND expired=0 AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&message_key).bind(&message_key).execute(&mut *c).await?;
     if let Some(job)=backfill_id{sqlx::query("UPDATE backfill_jobs SET delivered=delivered+1 WHERE id=?").bind(job).execute(&mut *c).await?;}Ok(())
    })).await?;
         } else {

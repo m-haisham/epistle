@@ -41,6 +41,8 @@ pub async fn handoff(store: &Store, stub: String, prepared: Prepared) -> Result<
   let Some(row)=row else{return Ok(())};
   let key=&prepared.message.id;let account=&prepared.message.account_id;
   sqlx::query("INSERT INTO messages(id,account_id,payload_path,created_at) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload_path=excluded.payload_path,expired=0,expires_at=NULL").bind(key).bind(account).bind(&prepared.payload_path).bind(now()).execute(&mut *c).await?;
+  sqlx::query("INSERT INTO message_payloads(path,message_key) VALUES(?,?)").bind(&prepared.payload_path).bind(key).execute(&mut *c).await?;
+  sqlx::query("UPDATE message_payloads SET expires_at=NULL WHERE message_key=? AND expired=0").bind(key).execute(&mut *c).await?;
   for f in prepared.files {let m=f.manifest;sqlx::query("INSERT INTO message_files(message_key,file_id,role,filename,content_type,size,sha256,content_id,path) VALUES(?,?,?,?,?,?,?,?,?)")
    .bind(key).bind(m.id).bind(m.role).bind(m.filename).bind(m.content_type).bind(m.size).bind(m.sha256).bind(m.content_id).bind(f.path).execute(&mut *c).await?;}
   sqlx::query("UPDATE message_files SET expires_at=NULL WHERE message_key=? AND expired=0").bind(key).execute(&mut *c).await?;

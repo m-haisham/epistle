@@ -27,20 +27,24 @@ pub fn parse_message(
     };
     let mut files = vec![];
     if let Some(m) = mail_parser::MessageParser::default().parse(&raw) {
+        // Adapted from Hark's src/imap/body.rs: retain groups, resent envelopes,
+        // sender and threading headers while keeping attachment bytes off the wire.
         fn addresses(list: Option<mail_parser::AddressList<'_>>) -> serde_json::Value {
-            json!(
-                list.map(|a| a
-                    .iter()
-                    .filter_map(|item| match item {
-                        mail_parser::Address::Mailbox(m) =>
-                            Some(json!({"name":m.name(),"address":m.address()})),
-                        mail_parser::Address::Group(_) => None,
-                    })
-                    .collect::<Vec<_>>())
-                    .unwrap_or_default()
-            )
+            json!(list.map(|a| a.iter().map(|item| match item {
+                mail_parser::Address::Mailbox(m) => json!({"name":m.name(),"address":m.address()}),
+                mail_parser::Address::Group(g) => json!({"name":g.name(),"members":g.mailboxes().map(|m|json!({"name":m.name(),"address":m.address()})).collect::<Vec<_>>()})
+            }).collect::<Vec<_>>()).unwrap_or_default())
         }
-        result.envelope = json!({"subject":m.subject(),"from":addresses(m.from()),"to":addresses(m.to()),"cc":addresses(m.cc()),"bcc":addresses(m.bcc()),"reply_to":addresses(m.reply_to()),"message_id":m.message_id(),"date":m.date().map(|d|d.to_rfc3339()),"received_at":p.internal_date});
+        let resent = if m.resent_from().is_some()
+            || m.resent_to().is_some()
+            || m.resent_message_id().is_some()
+            || m.resent_date().is_some()
+        {
+            json!({"from":addresses(m.resent_from()),"to":addresses(m.resent_to()),"cc":addresses(m.resent_cc()),"bcc":addresses(m.resent_bcc()),"sender":addresses(m.resent_sender()),"date":m.resent_date().map(|d|d.to_rfc3339()),"message_id":m.resent_message_id().map(|v|v.iter().collect::<Vec<_>>())})
+        } else {
+            serde_json::Value::Null
+        };
+        result.envelope = json!({"subject":m.subject(),"sender":addresses(m.sender()),"from":addresses(m.from()),"to":addresses(m.to()),"cc":addresses(m.cc()),"bcc":addresses(m.bcc()),"reply_to":addresses(m.reply_to()),"message_id":m.message_id(),"in_reply_to":m.in_reply_to().map(|v|v.iter().collect::<Vec<_>>()),"references":m.references().map(|v|v.iter().collect::<Vec<_>>()),"resent":resent,"date":m.date().map(|d|d.to_rfc3339()),"received_at":p.internal_date});
         result.headers = json!(
             m.headers()
                 .iter()
@@ -53,13 +57,13 @@ pub fn parse_message(
         for (role, body, mime, name) in [
             (
                 "text",
-                m.body_text(0),
+                join_bodies(m.text_bodies()),
                 "text/plain; charset=utf-8",
                 "body.txt",
             ),
             (
                 "html",
-                m.body_html(0),
+                join_bodies(m.html_bodies()),
                 "text/html; charset=utf-8",
                 "body.html",
             ),
@@ -74,9 +78,9 @@ pub fn parse_message(
                         bytes: body.as_bytes().to_vec(),
                     });
                 } else if role == "text" {
-                    result.text = Some(body.into_owned());
+                    result.text = Some(body);
                 } else {
-                    result.html = Some(body.into_owned());
+                    result.html = Some(body);
                 }
             }
         }
@@ -109,6 +113,15 @@ pub fn parse_message(
         bytes: raw,
     });
     (result, files)
+}
+
+fn join_bodies<'a>(bodies: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> Option<String> {
+    let parts: Vec<_> = bodies.collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +172,56 @@ mod tests {
             parse_message("m".into(), &pointer(), vec![], "live".into(), None, 256);
         assert!(message.parse_error);
         assert_eq!(files.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod hark_regressions {
+    use super::*;
+    #[test]
+    fn groups_resent_threading_and_all_body_parts_survive() {
+        let raw=b"From: Sender <s@example.test>\r\nSender: sender@example.test\r\nTo: Team: Alice <a@example.test>, Bob <b@example.test>;\r\nResent-From: relay@example.test\r\nResent-To: destination@example.test\r\nResent-Message-ID: <resent@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nfirst part\r\n--x\r\nContent-Type: text/plain\r\n\r\nsecond part\r\n--x--\r\n";
+        let p = Pointer {
+            account_id: "a".into(),
+            folder_id: "f".into(),
+            folder: "INBOX".into(),
+            uidvalidity: 1,
+            uid: 1,
+            rfc_message_id: None,
+            gmail_id: None,
+            thread_id: None,
+            labels: vec![],
+            flags: vec![],
+            size: 0,
+            internal_date: 100,
+        };
+        let (message, _) = parse_message("m".into(), &p, raw.to_vec(), "live".into(), None, 1000);
+        assert_eq!(
+            message
+                .envelope
+                .pointer("/to/0/members/1/address")
+                .and_then(|v| v.as_str()),
+            Some("b@example.test")
+        );
+        assert_eq!(
+            message
+                .envelope
+                .pointer("/resent/from/0/address")
+                .and_then(|v| v.as_str()),
+            Some("relay@example.test")
+        );
+        assert_eq!(
+            message
+                .envelope
+                .pointer("/in_reply_to/0")
+                .and_then(|v| v.as_str()),
+            Some("parent@example.test")
+        );
+        assert!(
+            message
+                .text
+                .as_ref()
+                .is_some_and(|s| s.contains("first part") && s.contains("second part"))
+        );
     }
 }

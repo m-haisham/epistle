@@ -116,6 +116,7 @@ impl Service {
         }
     }
     async fn supervise(self, a: Account, cancel: CancellationToken) {
+        let _ = self.store.status(&a.id, "connecting", None, 0).await;
         let mut failures = 0;
         let mut first_failure = 0;
         loop {
@@ -136,6 +137,15 @@ impl Service {
                     .status(&a.id, "reconnecting", Some("token_recycle"), 0)
                     .await;
                 continue;
+            }
+            if self
+                .store
+                .account(&a.id)
+                .await
+                .is_ok_and(|current| current.status == "active")
+            {
+                failures = 0;
+                first_failure = 0;
             }
             failures += 1;
             if first_failure == 0 {

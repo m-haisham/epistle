@@ -246,7 +246,7 @@ impl Config {
             .set_default("microsoft_client_secret", "")
             .map_err(cfg)?
             .add_source(config::File::with_name("epistle").required(false))
-            .add_source(config::Environment::default().try_parsing(true))
+            .add_source(config::Environment::default().try_parsing(false))
             .build()
             .map_err(cfg)?;
         let c: Self = settings.try_deserialize().map_err(cfg)?;
