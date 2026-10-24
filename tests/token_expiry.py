@@ -72,7 +72,7 @@ class Service:
 def exercise(service, kind):
     control(events=[], status=200, token_calls=0, revoked=False, token_lifetime=12,
             strict_rotation=True, expected_refresh="initial-refresh", issued_tokens={},
-            refresh_history=[], token_failures=0, introspections=[])
+            refresh_history=[], token_failures=0, introspections=[], refresh_expires_at=None)
     box = mailbox("oauth@example.test")
     folder = "Expiry-" + uuid.uuid4().hex
     assert box.create(folder)[0] == "OK"
@@ -159,6 +159,44 @@ def exercise(service, kind):
     print("PASS:", kind, "forced disconnect and token endpoint outage recover without re-consent or duplicate mail", flush=True)
 
 
+def exercise_refresh_deadline(service):
+    """A fixed grant deadline is not renewed just because its token rotates."""
+    deadline = time.time() + 18
+    control(events=[], status=200, token_calls=0, revoked=False, token_lifetime=12,
+            strict_rotation=True, expected_refresh="initial-refresh", issued_tokens={},
+            refresh_history=[], token_failures=0, introspections=[], refresh_expires_at=deadline)
+    box = mailbox("oauth@example.test")
+    folder = "Grant-" + uuid.uuid4().hex
+    assert box.create(folder)[0] == "OK"
+    code, _, created = request("/email/accounts", "POST", {
+        "external_ref": folder, "email": "oauth@example.test", "auth_kind": "google_oauth",
+        "config": {"host": "dovecot" if service.image else "127.0.0.1",
+                   "port": 143 if service.image else 1143, "tls": False, "folders": [folder]},
+        "credentials": {"refresh_token": "initial-refresh"},
+    })
+    assert code == 201, created
+    account = created["account"]["id"]
+    def health_deadline():
+        return next(a for a in request("/health")[2]["accounts"] if a["id"] == account)["refresh_token_expires_at"]
+    first = eventually(health_deadline)
+    assert deadline - 2 <= first <= deadline
+    eventually(lambda: len(issuer()["refresh_history"]) >= 2, timeout=20)
+    assert abs(health_deadline() - first) <= 1
+    eventually(lambda: request(f"/email/accounts/{account}")[2]["status"] == "needs_reauth", timeout=30)
+    assert request(f"/email/accounts/{account}")[2]["status_reason"] == "refresh_token_expired"
+    calls = issuer()["token_calls"]
+    time.sleep(1.2)
+    assert issuer()["token_calls"] == calls
+    # Importing newly authorized credentials clears the obsolete deadline.
+    control(refresh_expires_at=None, expected_refresh="new-consent", token_lifetime=3600)
+    assert request(f"/email/accounts/{account}/credentials", "POST", {"refresh_token": "new-consent"})[0] == 200
+    eventually(lambda: request(f"/email/accounts/{account}")[2]["status"] == "active")
+    assert health_deadline() is None
+    assert request(f"/email/accounts/{account}", "DELETE")[0] == 204
+    box.delete(folder); box.logout()
+    print("PASS: reported refresh-token deadline survives rotation, appears in health, parks on expiry and resets with new credentials", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", help="Test this image in place of the host debug binary")
@@ -170,6 +208,7 @@ def main():
             service.start()
             for kind in ("google_oauth", "microsoft_oauth"):
                 exercise(service, kind)
+            exercise_refresh_deadline(service)
             succeeded = True
         except BaseException:
             service.log.flush(); service.log.seek(0); print(service.log.read())
@@ -181,7 +220,7 @@ def main():
                 print("Cleanup failed for", service.name, service.volume, error.stderr)
                 if succeeded:
                     raise
-            control(strict_rotation=False, token_lifetime=3600, token_failures=0)
+            control(strict_rotation=False, token_lifetime=3600, token_failures=0, refresh_expires_at=None)
     print("PASS: OAuth expiry suite" + (" on " + args.image if args.image else " on host"), flush=True)
 
 if __name__ == "__main__":

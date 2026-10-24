@@ -7,6 +7,7 @@ state = {
     "token_lifetime": 3600, "strict_rotation": False, "expected_refresh": None,
     "issued_tokens": {}, "refresh_history": [], "token_failures": 0,
     "introspections": [],
+    "refresh_expires_at": None,
 }
 lock = threading.Lock()
 class Handler(BaseHTTPRequestHandler):
@@ -41,13 +42,17 @@ class Handler(BaseHTTPRequestHandler):
                     state["token_failures"] -= 1
                     return self.reply(503, {"error": "temporarily_unavailable"})
                 supplied = parse_qs(body.decode()).get("refresh_token", [None])[0]
-                if state["revoked"] or (state["strict_rotation"] and supplied != state["expected_refresh"]):
+                expired = state["refresh_expires_at"] is not None and time.time() >= state["refresh_expires_at"]
+                if state["revoked"] or expired or (state["strict_rotation"] and supplied != state["expected_refresh"]):
                     return self.reply(400, {"error": "invalid_grant"})
                 access = "test-access-"+str(state["token_calls"])
                 refresh = "rotated-"+str(state["token_calls"])
                 state["issued_tokens"][access] = time.time() + state["token_lifetime"]
                 state["expected_refresh"] = refresh
                 state["refresh_history"].append({"used": supplied, "issued": refresh})
-                return self.reply(200, {"access_token": access, "refresh_token": refresh, "expires_in": state["token_lifetime"], "scope": "https://mail.google.com/ https://outlook.office.com/IMAP.AccessAsUser.All offline_access"})
+                response = {"access_token": access, "refresh_token": refresh, "expires_in": state["token_lifetime"], "scope": "https://mail.google.com/ https://outlook.office.com/IMAP.AccessAsUser.All offline_access"}
+                if state["refresh_expires_at"] is not None:
+                    response["refresh_token_expires_in"] = max(0, int(state["refresh_expires_at"] - time.time()))
+                return self.reply(200, response)
         self.reply(404, {})
 ThreadingHTTPServer(("0.0.0.0", 8090), Handler).serve_forever()

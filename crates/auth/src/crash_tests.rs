@@ -47,10 +47,14 @@ impl Issuer {
             }
             let new = format!("refresh-{}", self.generation);
             self.valid.insert(new.clone());
-            body["refresh_token"] = serde_json::json!(new);
+            body.as_object_mut()
+                .unwrap()
+                .insert("refresh_token".into(), serde_json::json!(new));
         }
         if let Some(ttl) = self.refresh_lifetime {
-            body["refresh_token_expires_in"] = serde_json::json!(ttl);
+            body.as_object_mut()
+                .unwrap()
+                .insert("refresh_token_expires_in".into(), serde_json::json!(ttl));
         }
         (200, body, std::mem::take(&mut self.truncate_next))
     }

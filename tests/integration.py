@@ -47,7 +47,7 @@ def events(account=None,kind=None):
     return [e for e in all_events if (kind is None or e["body"]["kind"]==kind) and (account is None or e["body"].get("account_id",e["body"].get("message",{}).get("account_id"))==account)]
 
 def main():
-    request("/control","POST",{"events":[],"status":200,"revoked":False,"token_calls":0,"token_lifetime":3600,"strict_rotation":False,"expected_refresh":None,"issued_tokens":{},"refresh_history":[],"token_failures":0,"introspections":[]},base=MOCK,auth=False)
+    request("/control","POST",{"events":[],"status":200,"revoked":False,"token_calls":0,"token_lifetime":3600,"strict_rotation":False,"expected_refresh":None,"issued_tokens":{},"refresh_history":[],"token_failures":0,"introspections":[],"refresh_expires_at":None},base=MOCK,auth=False)
     with tempfile.TemporaryDirectory(prefix="epistle-integration-") as data:
         env={**os.environ,"API_KEY":KEY,"MASTER_KEY":"01"*32,"WEBHOOK_SECRET":SECRET,"WEBHOOK_URL":MOCK+"/webhook","PUBLIC_URL":BASE,"DATA_DIR":data,"BIND_ADDR":"127.0.0.1:18080","ALLOW_INSECURE_TEST_ENDPOINTS":"true","TOKEN_ENDPOINT_OVERRIDE":MOCK+"/token","GOOGLE_CLIENT_ID":"test","GOOGLE_CLIENT_SECRET":"test","RECONCILE_SECS":"1","WATCHDOG_SECS":"10","FILE_RETENTION_SECS":"12","DISK_RESERVE_BYTES":"0"}
         log=open(pathlib.Path(data)/"service.log","w+")
