@@ -16,12 +16,17 @@ def issuer():
 
 class Service:
     def __init__(self, directory, image):
-        # A rebuild of the tag during the test must not switch binaries on restart.
-        self.image = subprocess.check_output(
-            ["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True
-        ).strip() if image else None
         self.name = "epistle-expiry-" + uuid.uuid4().hex
         self.volume = self.name + "-data"
+        self.image = None
+        if image:
+            # Keep an actual reference: containerd may collect an untagged manifest
+            # after a rebuild even when its digest was saved by the test process.
+            image_id = subprocess.check_output(
+                ["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True
+            ).strip()
+            self.image = self.name + "-image:latest"
+            subprocess.run(["docker", "image", "tag", image_id, self.image], check=True, capture_output=True)
         self.log = open(pathlib.Path(directory) / "service.log", "w+")
         self.process = None
         self.env = {
@@ -53,7 +58,9 @@ class Service:
     def stop(self, crash=False):
         if self.process is None:
             return
-        if self.image:
+        if self.process.poll() is not None:
+            self.process.wait()
+        elif self.image:
             subprocess.run(["docker", "kill" if crash else "stop", self.name], check=True, capture_output=True)
         elif crash:
             self.process.kill()
@@ -63,10 +70,16 @@ class Service:
         self.process = None
 
     def close(self):
-        self.stop()
-        if self.image:
-            subprocess.run(["docker", "volume", "rm", self.volume], check=True, capture_output=True)
-        self.log.close()
+        try:
+            self.stop()
+            if self.image:
+                result = subprocess.run(["docker", "volume", "rm", self.volume], capture_output=True)
+                if result.returncode and b"no such volume" not in result.stderr.lower():
+                    result.check_returncode()
+        finally:
+            if self.image:
+                subprocess.run(["docker", "image", "rm", self.image], check=True, capture_output=True)
+            self.log.close()
 
 
 def exercise(service, kind):

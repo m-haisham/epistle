@@ -1,8 +1,28 @@
 #!/usr/bin/env python3
 """Folder failure isolation and recovery against Dovecot, on host or distroless."""
-import argparse, tempfile, uuid
+import argparse, subprocess, tempfile, uuid
 from integration import request, eventually, mailbox, mail, events
 from token_expiry import Service, control
+
+
+def verify_image_pin(directory, image):
+    alias = "epistle-pin-probe-" + uuid.uuid4().hex + ":latest"
+    subprocess.run(["docker", "image", "tag", image, alias], check=True, capture_output=True)
+    probe = None
+    try:
+        probe = Service(directory, alias)
+        def image_id(ref):
+            return subprocess.check_output(["docker", "image", "inspect", ref, "--format", "{{.Id}}"], text=True).strip()
+        original = image_id(probe.image)
+        # The mock's base image is already present in the required Compose stack.
+        subprocess.run(["docker", "image", "tag", "python:3.13-slim", alias], check=True, capture_output=True)
+        assert image_id(alias) != original
+        assert image_id(probe.image) == original
+    finally:
+        if probe is not None:
+            probe.close()  # Also exercise cleanup before any container was started.
+        subprocess.run(["docker", "image", "rm", alias], check=True, capture_output=True)
+    print("PASS: container harness retains its image across retagging and cleans up unstarted services", flush=True)
 
 
 def exercise(service):
@@ -58,6 +78,8 @@ def main():
     parser.add_argument("--image")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="epistle-recovery-") as directory:
+        if args.image:
+            verify_image_pin(directory, args.image)
         service = Service(directory, args.image)
         try:
             service.start()
