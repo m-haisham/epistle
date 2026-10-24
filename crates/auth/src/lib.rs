@@ -41,6 +41,7 @@ pub struct Credentials {
     pub refresh_token: Option<String>,
     pub access_token: Option<String>,
     pub access_expires_at: Option<i64>,
+    pub access_issued_at: Option<i64>,
     pub scopes: Vec<String>,
     pub client_email: Option<String>,
     pub private_key: Option<String>,
@@ -139,7 +140,29 @@ pub struct TokenProvider {
 pub struct Access {
     pub secret: SecretString,
     pub expires_at: i64,
+    pub refresh_at: i64,
     pub password: bool,
+}
+impl Access {
+    /// Recycle only once the cached token is refreshable. Short-lived tokens need
+    /// a proportionally smaller margin or they cause an immediate reconnect loop.
+    pub fn recycle_at(&self, account_id: &str) -> i64 {
+        if self.password {
+            return i64::MAX;
+        }
+        let jitter = i64::from(account_id.bytes().next().unwrap_or(0) % 30);
+        (self.expires_at - 60 - jitter).max(self.refresh_at)
+    }
+}
+impl Credentials {
+    fn refresh_at(&self) -> i64 {
+        let expiry = self.access_expires_at.unwrap_or(0);
+        // Older encrypted records have no issuance time; retain their 5-minute margin.
+        let margin = self.access_issued_at.map_or(300, |issued| {
+            (expiry.saturating_sub(issued) / 10).clamp(1, 300)
+        });
+        expiry.saturating_sub(margin)
+    }
 }
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -217,17 +240,19 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scop
                     .clone()
                     .ok_or(Error::Reauth("credentials_rejected"))?
                     .into(),
-                expires_at: now() + 3600,
+                expires_at: i64::MAX,
+                refresh_at: i64::MAX,
                 password: true,
             });
         }
         if !force
-            && c.access_expires_at.unwrap_or(0) > now() + 300
+            && c.refresh_at() > now()
             && let Some(token) = &c.access_token
         {
             return Ok(Access {
                 secret: token.clone().into(),
                 expires_at: c.access_expires_at.unwrap_or(0),
+                refresh_at: c.refresh_at(),
                 password: false,
             });
         }
@@ -288,6 +313,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scop
         Ok(Access {
             secret: c.access_token.clone().ok_or(Error::Data)?.into(),
             expires_at: c.access_expires_at.ok_or(Error::Data)?,
+            refresh_at: c.refresh_at(),
             password: false,
         })
     }
@@ -378,7 +404,9 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scop
             return Err(Error::Reauth("scope_missing"));
         }
         c.access_token = Some(r.access_token);
-        c.access_expires_at = Some(now() + r.expires_in.unwrap_or(3600).clamp(1, 86400));
+        let issued = now();
+        c.access_issued_at = Some(issued);
+        c.access_expires_at = Some(issued + r.expires_in.unwrap_or(3600).clamp(1, 86400));
         if let Some(token) = r.refresh_token {
             c.refresh_token = Some(token);
         }
@@ -548,6 +576,28 @@ mod tests {
         clippy::indexing_slicing
     )]
     use super::*;
+    #[test]
+    fn short_lived_tokens_have_a_reusable_window_and_legacy_records_keep_their_margin() {
+        let mut c = Credentials {
+            access_issued_at: Some(1000),
+            access_expires_at: Some(1012),
+            ..Default::default()
+        };
+        assert_eq!(c.refresh_at(), 1011);
+        let access = Access {
+            secret: "test".into(),
+            expires_at: 1012,
+            refresh_at: c.refresh_at(),
+            password: false,
+        };
+        for id in ["a", "z", "0"] {
+            assert_eq!(access.recycle_at(id), 1011);
+        }
+        c.access_expires_at = Some(4600);
+        assert_eq!(c.refresh_at(), 4300);
+        c.access_issued_at = None;
+        assert_eq!(c.refresh_at(), 4300);
+    }
     #[test]
     fn envelope_encryption_binds_account_and_detects_tampering() {
         let vault = Vault::new(&"01".repeat(32)).unwrap();

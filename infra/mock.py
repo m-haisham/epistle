@@ -1,8 +1,13 @@
 """Local-only webhook recorder and deterministic OAuth issuer for integration tests."""
-import json, os, threading
+import json, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
-state = {"events": [], "status": 200, "token_calls": 0, "revoked": False}
+state = {
+    "events": [], "status": 200, "token_calls": 0, "revoked": False,
+    "token_lifetime": 3600, "strict_rotation": False, "expected_refresh": None,
+    "issued_tokens": {}, "refresh_history": [], "token_failures": 0,
+    "introspections": [],
+}
 lock = threading.Lock()
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
@@ -15,7 +20,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/events": return self.reply(200, state)
             if self.path == "/introspect":
                 token = self.headers.get("Authorization", "").removeprefix("Bearer ")
-                return self.reply(200, {"active": not state["revoked"] and token.startswith("test-access-"), "email": "oauth@example.test"})
+                expiry = state["issued_tokens"].get(token, 0)
+                active = not state["revoked"] and time.time() < expiry
+                state["introspections"].append({"token": token, "active": active})
+                return self.reply(200, {"active": active, "email": "oauth@example.test"})
         self.reply(404, {})
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -29,7 +37,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {})
             if self.path == "/token":
                 state["token_calls"] += 1
-                if state["revoked"]: return self.reply(400, {"error": "invalid_grant"})
-                return self.reply(200, {"access_token": "test-access-"+str(state["token_calls"]), "refresh_token": "rotated-"+str(state["token_calls"]), "expires_in": 3600, "scope": "https://mail.google.com/"})
+                if state["token_failures"]:
+                    state["token_failures"] -= 1
+                    return self.reply(503, {"error": "temporarily_unavailable"})
+                supplied = parse_qs(body.decode()).get("refresh_token", [None])[0]
+                if state["revoked"] or (state["strict_rotation"] and supplied != state["expected_refresh"]):
+                    return self.reply(400, {"error": "invalid_grant"})
+                access = "test-access-"+str(state["token_calls"])
+                refresh = "rotated-"+str(state["token_calls"])
+                state["issued_tokens"][access] = time.time() + state["token_lifetime"]
+                state["expected_refresh"] = refresh
+                state["refresh_history"].append({"used": supplied, "issued": refresh})
+                return self.reply(200, {"access_token": access, "refresh_token": refresh, "expires_in": state["token_lifetime"], "scope": "https://mail.google.com/ https://outlook.office.com/IMAP.AccessAsUser.All offline_access"})
         self.reply(404, {})
 ThreadingHTTPServer(("0.0.0.0", 8090), Handler).serve_forever()

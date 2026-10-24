@@ -4,3 +4,4 @@
 /.env
 *.sqlite*
 /.hshm
+__pycache__/

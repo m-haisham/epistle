@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 impl Service {
     pub(crate) async fn watch(&self, a: &Account) -> Result<(), Error> {
         self.store.worker_state(&a.id, "authenticating").await?;
-        let (mut conn, expiry) = self.connect(a).await?;
+        let (mut conn, recycle_at) = self.connect(a).await?;
         let names = conn.folders(a).await?;
         self.store.worker_state(&a.id, "syncing").await?;
         loop {
-            if now() >= expiry - 60 - (a.id.bytes().next().unwrap_or(0) as i64 % 30) {
+            if now() >= recycle_at {
                 conn.logout().await;
                 return Err(Error::Recycle);
             }
@@ -96,7 +96,7 @@ Ok(())})).await?;
             let seconds = self
                 .config
                 .reconcile_secs
-                .min((expiry - now() - 90).max(1) as u64);
+                .min((recycle_at - now()).max(1) as u64);
             conn = conn.idle(seconds).await?;
         }
     }
@@ -134,7 +134,7 @@ ORDER BY created_at,id LIMIT ?
             }
             if connection
                 .as_ref()
-                .is_none_or(|(_, expiry)| *expiry <= now() + 60)
+                .is_none_or(|(_, recycle_at)| *recycle_at <= now())
             {
                 if let Some((c, _)) = connection.take() {
                     c.logout().await;

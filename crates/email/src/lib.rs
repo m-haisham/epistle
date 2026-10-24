@@ -40,16 +40,17 @@ pub struct Service {
 impl Service {
     pub async fn connect(&self, a: &Account) -> Result<(Connection, i64), Error> {
         let access = self.tokens.get_access_token(a, false).await?;
-        let expiry = access.expires_at;
+        let recycle_at = access.recycle_at(&a.id);
         match Connection::connect(a, access.secret, access.password, self.config.watchdog_secs)
             .await
         {
-            Ok(c) => Ok((c, expiry)),
+            Ok(c) => Ok((c, recycle_at)),
             Err(e) if e.auth && a.auth_kind != epistle_core::AuthKind::Password => {
                 let access = self.tokens.get_access_token(a, true).await?;
+                let recycle_at = access.recycle_at(&a.id);
                 match Connection::connect(a, access.secret, false, self.config.watchdog_secs).await
                 {
-                    Ok(c) => Ok((c, access.expires_at)),
+                    Ok(c) => Ok((c, recycle_at)),
                     Err(e) if e.auth => {
                         Err(epistle_auth::Error::Reauth("credentials_rejected").into())
                     }
