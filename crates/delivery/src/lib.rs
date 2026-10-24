@@ -336,8 +336,16 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
             let worker = self.clone();
             tasks.spawn(async move { worker.deliver(row).await });
         }
+        // Drain every independent delivery even when one fails to commit. Dropping
+        // the JoinSet here would abort unrelated requests after remote acceptance.
+        let mut failure = None;
         while let Some(result) = tasks.join_next().await {
-            result??;
+            if let Err(error) = result.map_err(Error::Join).and_then(|r| r) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(count)
     }
@@ -348,7 +356,25 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
         let body = if let Some(p) = row.try_get::<Option<String>, _>("payload")? {
             p.into_bytes()
         } else {
-            tokio::fs::read(row.try_get::<String, _>("payload_path")?).await?
+            match tokio::fs::read(row.try_get::<String, _>("payload_path")?).await {
+                Ok(body) => body,
+                Err(error) => {
+                    let missing = error.kind() == std::io::ErrorKind::NotFound;
+                    self.fail_delivery(
+                        seq,
+                        row.try_get::<i64, _>("attempts")? + 1,
+                        if missing {
+                            "payload_missing".into()
+                        } else {
+                            "payload_unreadable".into()
+                        },
+                        !missing,
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
         };
         let timestamp = now();
         let sig = signature(&self.config.webhook_secret, timestamp, &body)?;
@@ -424,26 +450,42 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
         } else {
             let attempts = row.try_get::<i64, _>("attempts")? + 1;
             let retryable = status.is_none_or(|s| s >= 500 || s == 408 || s == 429);
-            let dead = !retryable || attempts >= self.config.max_attempts;
             let delay = response
                 .as_ref()
                 .ok()
                 .and_then(|r| r.headers().get("retry-after"))
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<i64>().ok())
-                .map(|s| s.clamp(1, 86400))
-                .unwrap_or_else(|| backoff(attempts));
+                .map(|s| s.clamp(1, 86400));
             let reason = status
                 .map(|s| format!("http_{s}"))
                 .unwrap_or_else(|| "network_error".into());
-            self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE outbox SET state=?,attempts=?,next_attempt_at=?,last_error=? WHERE seq=?").bind(if dead{"dead"}else{"pending"}).bind(attempts).bind(now()+delay).bind(reason).bind(seq).execute(c).await?;
-Ok(())})).await?;
-            if dead {
-                tracing::error!(
-                    delivery_id = seq,
-                    "webhook delivery dead; replay or discard required"
-                );
-            }
+            self.fail_delivery(seq, attempts, reason, retryable, delay)
+                .await?;
+        }
+        Ok(())
+    }
+    async fn fail_delivery(
+        &self,
+        seq: i64,
+        attempts: i64,
+        reason: String,
+        retryable: bool,
+        delay: Option<i64>,
+    ) -> Result<(), Error> {
+        let dead = !retryable || attempts >= self.config.max_attempts;
+        let delay = delay.unwrap_or_else(|| backoff(attempts));
+        self.store.write(move |c| Box::pin(async move {
+            sqlx::query("UPDATE outbox SET state=?,attempts=?,next_attempt_at=?,last_error=? WHERE seq=?")
+                .bind(if dead { "dead" } else { "pending" }).bind(attempts)
+                .bind(now() + delay).bind(reason).bind(seq).execute(c).await?;
+            Ok(())
+        })).await?;
+        if dead {
+            tracing::error!(
+                delivery_id = seq,
+                "webhook delivery dead; replay or discard required"
+            );
         }
         Ok(())
     }

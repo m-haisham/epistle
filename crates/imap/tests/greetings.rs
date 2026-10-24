@@ -155,3 +155,91 @@ async fn missing_greeting_is_bounded_by_watchdog() {
     );
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn login_outage_is_not_misclassified_as_revoked_credentials() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = account(listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"* OK ready\r\n").await.unwrap();
+        let mut io = BufReader::new(socket);
+        let mut line = String::new();
+        io.read_line(&mut line).await.unwrap();
+        let tag = line.split_whitespace().next().unwrap();
+        io.get_mut()
+            .write_all(format!("{tag} NO [UNAVAILABLE] maintenance\r\n").as_bytes())
+            .await
+            .unwrap();
+    });
+    let error = Connection::connect(&a, "secret".into(), true, 2)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.reason, "provider_outage");
+    assert!(!error.auth && !error.permanent);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn epoch_fallback_checks_exact_message_id_before_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = account(listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"* OK ready\r\n").await.unwrap();
+        let mut io = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            if io.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let tag = line.split_whitespace().next().unwrap();
+            let data = if line.contains(" CAPABILITY") {
+                "* CAPABILITY IMAP4rev1\r\n"
+            } else if line.contains(" SELECT ") {
+                "* 2 EXISTS\r\n* OK [UIDVALIDITY 2] epoch\r\n"
+            } else if line.contains("UID SEARCH HEADER") {
+                "* SEARCH 7 8\r\n"
+            } else if line.contains("UID FETCH 7,8 (UID ENVELOPE)") {
+                "* 1 FETCH (UID 7 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL \"prefix<target@example.test>suffix\"))\r\n* 2 FETCH (UID 8 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL \"<target@example.test>\"))\r\n"
+            } else if line.contains("UID SEARCH UID 8") {
+                "* SEARCH 8\r\n"
+            } else if line.contains("UID STORE") {
+                assert!(
+                    line.contains("UID STORE 8 "),
+                    "must never modify substring candidate: {line}"
+                );
+                ""
+            } else {
+                assert!(line.contains(" LOGIN ") || line.contains(" LOGOUT"));
+                ""
+            };
+            io.get_mut()
+                .write_all(format!("{data}{tag} OK done\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let mut conn = Connection::connect(&a, "secret".into(), true, 2)
+        .await
+        .unwrap();
+    let pointer = epistle_core::Pointer {
+        account_id: a.id.clone(),
+        folder_id: "f".into(),
+        folder: "INBOX".into(),
+        uidvalidity: 1,
+        uid: 7,
+        rfc_message_id: Some("<target@example.test>".into()),
+        gmail_id: None,
+        thread_id: None,
+        labels: vec![],
+        flags: vec![],
+        size: 1,
+        internal_date: 0,
+    };
+    let resolved = conn.mark_read(&pointer, true).await.unwrap().unwrap();
+    assert_eq!((resolved.uidvalidity, resolved.uid), (2, 8));
+    drop(conn);
+    server.await.unwrap();
+}

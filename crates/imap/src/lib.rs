@@ -189,8 +189,11 @@ impl Connection {
                     .await
             }
             .map_err(|(e, _)| {
+                let explicit_outage = matches!(&e,
+                    async_imap::error::Error::No(s) | async_imap::error::Error::Bad(s)
+                    if s.to_ascii_uppercase().contains("[UNAVAILABLE]"));
                 let mut classified = Error::from(e);
-                if classified.reason == "provider_outage" {
+                if classified.reason == "provider_outage" && !explicit_outage {
                     classified.auth = true;
                     classified.reason = "credentials_rejected";
                 }
@@ -352,9 +355,14 @@ impl Connection {
     }
     pub async fn resolve(&mut self, p: &Pointer, write: bool) -> Result<Option<Pointer>, Error> {
         let mailbox = if write {
-            bounded(self.timeout, self.session.select(&p.folder)).await?
+            bounded(self.timeout, self.session.select(&p.folder)).await
         } else {
-            self.examine(&p.folder).await?
+            self.examine(&p.folder).await
+        };
+        let mailbox = match mailbox {
+            Ok(mailbox) => mailbox,
+            Err(e) if e.reason == "mailbox_missing" => return Ok(None),
+            Err(e) => return Err(e),
         };
         let validity = i64::from(mailbox.uid_validity.ok_or(Error {
             reason: "uidvalidity_missing",
@@ -369,10 +377,35 @@ impl Connection {
             let ids = self
                 .search(&format!("HEADER Message-ID {}", quote(mid)?))
                 .await?;
-            let Some(uid) = ids.first() else {
-                return Ok(None);
-            };
-            resolved.uid = i64::from(*uid);
+            // IMAP HEADER searches are substring matches. Never FETCH/STORE a
+            // different message just because its Message-ID contains this one.
+            let mut exact = None;
+            for chunk in ids.chunks(500) {
+                let set = chunk
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let candidates = bounded(self.timeout, async {
+                    self.session
+                        .uid_fetch(set, "(UID ENVELOPE)")
+                        .await?
+                        .try_collect::<Vec<_>>()
+                        .await
+                })
+                .await?;
+                exact = candidates
+                    .iter()
+                    .find(|f| {
+                        f.envelope().and_then(|e| e.message_id.as_deref()) == Some(mid.as_bytes())
+                    })
+                    .and_then(|f| f.uid);
+                if exact.is_some() {
+                    break;
+                }
+            }
+            let Some(uid) = exact else { return Ok(None) };
+            resolved.uid = i64::from(uid);
             resolved.uidvalidity = validity;
         }
         Ok(Some(resolved))

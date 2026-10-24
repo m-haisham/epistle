@@ -585,11 +585,25 @@ account_id,encrypted_verifier,revision
         let r = self.exchange(&self.endpoint(&a), &form).await?;
         let mut c = self.load(&a.id).await?;
         self.apply_response(&a, &mut c, r, true)?;
-        self.save(&a.id, &c).await?;
+        // Credentials and activation must commit together. Otherwise a crash can
+        // leave a successfully authorized account parked in needs_reauth forever.
+        let sealed = self.encrypt_credentials(&a.id, &c)?;
+        let access_exp = c.access_expires_at;
+        let refresh_exp = c.refresh_token_expires_at;
+        let scopes = serde_json::to_string(&c.scopes).map_err(|_| Error::Data)?;
         let id = a.id.clone();
+        let revision = a.revision;
         self.store
             .write(move |db| {
                 Box::pin(async move {
+                    let current: Option<i64> = sqlx::query_scalar("SELECT revision FROM accounts WHERE id=?")
+                        .bind(&id).fetch_optional(&mut *db).await?;
+                    if current != Some(revision) {
+                        return Err(epistle_store::Error::Conflict("stale_oauth_callback"));
+                    }
+                    sqlx::query("UPDATE credentials SET ciphertext=?,access_expires_at=?,refresh_expires_at=?,scopes=?,updated_at=? WHERE account_id=?")
+                        .bind(sealed).bind(access_exp).bind(refresh_exp).bind(scopes).bind(now()).bind(&id)
+                        .execute(&mut *db).await?;
                     sqlx::query("UPDATE accounts SET revision=revision+1,enabled=1 WHERE id=?")
                         .bind(&id)
                         .execute(&mut *db)
@@ -597,7 +611,10 @@ account_id,encrypted_verifier,revision
                     epistle_store::status_tx(db, &id, "connecting", None, 0).await
                 })
             })
-            .await?;
+            .await.map_err(|e| match e {
+                epistle_store::Error::Conflict("stale_oauth_callback") => Error::State,
+                other => Error::Store(other),
+            })?;
         Ok(a.id)
     }
 }

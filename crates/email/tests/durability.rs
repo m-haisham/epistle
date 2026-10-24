@@ -352,3 +352,89 @@ async fn rediscovery_redirects_in_flight_fetch_and_revives_gone_stub() {
         .unwrap();
     assert_eq!(state, "pending");
 }
+
+#[tokio::test]
+async fn missing_payload_is_dead_and_does_not_abort_independent_deliveries() {
+    let (dir, store, files) = fixture().await;
+    discover(&store, false).await;
+    let (stub, prepared) = prepare(&store, &files).await;
+    let payload = prepared.payload_path.clone();
+    let retained_file = prepared.files.first().unwrap().path.clone();
+    handoff(&store, stub, prepared).await.unwrap();
+    tokio::fs::remove_file(&payload).await.unwrap();
+    store.status("a", "active", None, 0).await.unwrap();
+    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = received.clone();
+    let app = axum::Router::new().route(
+        "/webhook",
+        axum::routing::post(move || {
+            let seen = seen.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                seen.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = support::config(dir.path());
+    config.webhook_url = format!("http://{}/webhook", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let delivery = Delivery::new(store.clone(), Arc::new(config.clone())).unwrap();
+    assert_eq!(delivery.tick().await.unwrap(), 2);
+    assert_eq!(received.load(Ordering::SeqCst), 1);
+    let failure: (String, String) = sqlx::query_as("SELECT state,last_error FROM outbox")
+        .fetch_one(&store.reads)
+        .await
+        .unwrap();
+    assert_eq!(failure, ("dead".into(), "payload_missing".into()));
+    assert_eq!(delivery.tick().await.unwrap(), 0);
+    files.sweep(&store, &config, false).await.unwrap();
+    assert!(std::path::Path::new(&retained_file).exists());
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_ack_does_not_cancel_slow_independent_delivery() {
+    let (dir, store, files) = fixture().await;
+    discover(&store, false).await;
+    let (stub, prepared) = prepare(&store, &files).await;
+    handoff(&store, stub, prepared).await.unwrap();
+    store.status("a", "active", None, 0).await.unwrap();
+    store.write(|c| Box::pin(async move {
+        sqlx::query("CREATE TRIGGER fail_message_ack BEFORE DELETE ON outbox WHEN OLD.kind='email.message.received' BEGIN SELECT RAISE(ABORT,'injected'); END").execute(c).await?;
+        Ok(())
+    })).await.unwrap();
+    let app = axum::Router::new().route(
+        "/webhook",
+        axum::routing::post(
+            |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                if body.get("kind").and_then(|v| v.as_str()) == Some("account.status_changed") {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                axum::http::StatusCode::OK
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = support::config(dir.path());
+    config.webhook_url = format!("http://{}/webhook", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    assert!(
+        Delivery::new(store.clone(), Arc::new(config))
+            .unwrap()
+            .tick()
+            .await
+            .is_err()
+    );
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM outbox")
+        .fetch_all(&store.reads)
+        .await
+        .unwrap();
+    assert_eq!(kinds, ["email.message.received"]);
+    server.abort();
+}
