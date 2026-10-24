@@ -1,18 +1,28 @@
+//! Shared configuration, identifiers and mail data types.
+
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, path::PathBuf};
 use thiserror::Error;
+
+/// Returns the current Unix timestamp in seconds.
 pub fn now() -> i64 {
     Utc::now().timestamp()
 }
+
+/// Creates an opaque identifier.
 pub fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+/// Returns a hexadecimal SHA-256 digest.
 pub fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+
+/// Returns a capped, jittered retry delay in seconds.
 pub fn backoff(attempt: i64) -> i64 {
     (5_i64.saturating_mul(2_i64.saturating_pow(attempt.clamp(0, 10) as u32))).min(3600)
         + i64::from(rand::random::<u8>() % 10)
@@ -24,6 +34,7 @@ pub enum Error {
     Config(String),
 }
 
+/// Supported account authentication strategies.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthKind {
@@ -32,12 +43,15 @@ pub enum AuthKind {
     MicrosoftOauth,
     GoogleServiceAccount,
 }
+
 impl AuthKind {
+    /// Reports whether this strategy uses user OAuth consent.
     pub fn oauth(self) -> bool {
         matches!(self, Self::GoogleOauth | Self::MicrosoftOauth)
     }
 }
 
+/// IMAP connection and initial synchronization settings.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountConfig {
@@ -48,6 +62,7 @@ pub struct AccountConfig {
     pub initial_sync_days: u32,
     pub tenant: String,
 }
+
 impl Default for AccountConfig {
     fn default() -> Self {
         Self {
@@ -60,7 +75,9 @@ impl Default for AccountConfig {
         }
     }
 }
+
 impl AccountConfig {
+    /// Applies provider defaults and validates connection settings.
     pub fn normalize(&mut self, kind: AuthKind, allow_insecure: bool) -> Result<(), Error> {
         if self.host.is_empty() {
             self.host = match kind {
@@ -92,10 +109,12 @@ impl AccountConfig {
         {
             return Err(Error::Config("invalid folders".into()));
         }
+
         Ok(())
     }
 }
 
+/// Persisted account state and configuration revision.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Account {
     pub id: String,
@@ -112,6 +131,8 @@ pub struct Account {
     pub enabled: bool,
     pub revision: i64,
 }
+
+/// Public metadata for a retained message file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FileManifest {
     pub id: String,
@@ -128,6 +149,8 @@ pub struct FileManifest {
     #[serde(default)]
     pub content_location: Option<String>,
 }
+
+/// Normalized email delivered to webhook consumers.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Message {
     pub id: String,
@@ -144,6 +167,8 @@ pub struct Message {
     pub parse_error: bool,
     pub files: Vec<FileManifest>,
 }
+
+/// Mailbox location and identity used to recover moved messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pointer {
     pub account_id: String,
@@ -159,7 +184,9 @@ pub struct Pointer {
     pub size: i64,
     pub internal_date: i64,
 }
+
 impl Pointer {
+    /// Returns the provider identity used for deduplication.
     pub fn identity(&self) -> String {
         self.gmail_id
             .as_ref()
@@ -167,6 +194,8 @@ impl Pointer {
             .or_else(|| self.rfc_message_id.as_ref().map(|s| format!("rfc:{s}")))
             .unwrap_or_else(|| format!("{}:{}:{}", self.folder_id, self.uidvalidity, self.uid))
     }
+
+    /// Returns the stable location key for this pointer.
     pub fn key(&self) -> String {
         format!(
             "email:{}:{}:{}:{}",
@@ -175,6 +204,7 @@ impl Pointer {
     }
 }
 
+/// Validated service configuration loaded from defaults, TOML and environment.
 #[derive(Clone, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -203,7 +233,9 @@ pub struct Config {
     pub microsoft_client_secret: String,
     pub token_endpoint_override: Option<String>,
 }
+
 impl Config {
+    /// Loads and validates defaults, optional TOML and environment settings.
     pub fn from_env() -> Result<Self, Error> {
         let settings = config::Config::builder()
             .set_default("data_dir", "./data")
@@ -255,6 +287,7 @@ impl Config {
             .build()
             .map_err(cfg)?;
         let c: Self = settings.try_deserialize().map_err(cfg)?;
+
         if c.api_key.len() < 32 || c.webhook_secret.len() < 32 || c.master_key.len() != 64 {
             return Err(Error::Config("API_KEY and WEBHOOK_SECRET need at least 32 characters; MASTER_KEY must be 64 hex characters".into()));
         }
@@ -278,6 +311,7 @@ impl Config {
         if c.token_endpoint_override.is_some() && !c.allow_insecure {
             return Err(Error::Config("token override is test-only".into()));
         }
+
         Ok(c)
     }
 }

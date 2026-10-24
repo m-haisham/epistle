@@ -1,6 +1,7 @@
 //! Fault injection lives only in the unit-test binary, never in the service.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
+
 #[path = "../../../tests/support/mod.rs"]
 mod support;
 use secrecy::ExposeSecret;
@@ -20,6 +21,7 @@ enum Policy {
     MicrosoftRetainsOld,
     StrictSingleUse,
 }
+
 struct Issuer {
     policy: Policy,
     valid: HashSet<String>,
@@ -30,21 +32,26 @@ struct Issuer {
     truncate_next: bool,
     refresh_lifetime: Option<u64>,
 }
+
 impl Issuer {
     fn issue(&mut self, refresh: String) -> (u16, serde_json::Value, bool) {
         self.used.push(refresh.clone());
+
         if self.revoked || self.expired || !self.valid.contains(&refresh) {
             return (400, serde_json::json!({"error":"invalid_grant"}), false);
         }
+
         self.generation += 1;
         let mut body = serde_json::json!({
             "access_token": format!("access-{}", self.generation), "expires_in": 3600,
             "scope": "https://mail.google.com/ https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
         });
+
         if !matches!(self.policy, Policy::GoogleReusable) {
             if matches!(self.policy, Policy::StrictSingleUse) {
                 self.valid.clear();
             }
+
             let new = format!("refresh-{}", self.generation);
             self.valid.insert(new.clone());
             body.as_object_mut()
@@ -59,16 +66,19 @@ impl Issuer {
         (200, body, std::mem::take(&mut self.truncate_next))
     }
 }
+
 struct Server {
     endpoint: String,
     state: Arc<Mutex<Issuer>>,
     task: tokio::task::JoinHandle<()>,
 }
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
+
 impl Server {
     async fn new(policy: Policy) -> Self {
         let state = Arc::new(Mutex::new(Issuer {
@@ -89,8 +99,10 @@ impl Server {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut io = BufReader::new(socket);
                 let mut length = 0;
+
                 loop {
                     let mut line = String::new();
+
                     if io.read_line(&mut line).await.unwrap() == 0 {
                         break;
                     }
@@ -101,6 +113,7 @@ impl Server {
                         break;
                     }
                 }
+
                 let mut body = vec![0; length];
                 io.read_exact(&mut body).await.unwrap();
                 let fields: HashMap<_, _> =
@@ -126,12 +139,14 @@ impl Server {
         }
     }
 }
+
 async fn provider(dir: &std::path::Path, endpoint: &str) -> TokenProvider {
     let store = Store::open(&dir.join("test.sqlite")).await.unwrap();
     let mut config = support::config(dir);
     config.token_endpoint_override = Some(endpoint.into());
     TokenProvider::new(store, Arc::new(config)).unwrap()
 }
+
 async fn seed(dir: &std::path::Path, server: &Server, kind: AuthKind) -> TokenProvider {
     let p = provider(dir, &server.endpoint).await;
     support::account(&p.store, kind).await;
@@ -146,6 +161,7 @@ async fn seed(dir: &std::path::Path, server: &Server, kind: AuthKind) -> TokenPr
     .unwrap();
     p
 }
+
 struct Child(std::process::Child);
 impl Drop for Child {
     fn drop(&mut self) {
@@ -181,6 +197,7 @@ enum Invalidation {
     Revoked,
     Expired,
 }
+
 async fn crash_case(policy: Policy, invalidate: Invalidation) {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::new(policy).await;
@@ -252,7 +269,9 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
         Some("initial-refresh")
     );
     let a = recovered.store.account("a").await.unwrap();
+
     let result = recovered.get_access_token(&a, false).await;
+
     if matches!(policy, Policy::StrictSingleUse) || !matches!(invalidate, Invalidation::None) {
         assert!(matches!(result, Err(Error::Reauth("token_revoked"))));
         assert_eq!(
@@ -289,22 +308,27 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
 async fn google_reuses_persisted_token_after_response_before_save_process_crash() {
     crash_case(Policy::GoogleReusable, Invalidation::None).await;
 }
+
 #[tokio::test]
 async fn microsoft_reuses_previous_token_after_rotation_before_save_process_crash() {
     crash_case(Policy::MicrosoftRetainsOld, Invalidation::None).await;
 }
+
 #[tokio::test]
 async fn strict_single_use_provider_cannot_recover_a_lost_replacement() {
     crash_case(Policy::StrictSingleUse, Invalidation::None).await;
 }
+
 #[tokio::test]
 async fn revoked_token_after_crash_requires_reauthorization_without_retry_loop() {
     crash_case(Policy::MicrosoftRetainsOld, Invalidation::Revoked).await;
 }
+
 #[tokio::test]
 async fn provider_expiration_after_crash_requires_reauthorization_without_retry_loop() {
     crash_case(Policy::GoogleReusable, Invalidation::Expired).await;
 }
+
 #[tokio::test]
 async fn lost_success_response_is_retryable_with_the_durable_token() {
     for (policy, kind) in [
@@ -393,6 +417,7 @@ async fn new_consent_resets_deadline_but_missing_refresh_token_does_not() {
     let a = p.store.account("a").await.unwrap();
     let mut c = p.load("a").await.unwrap();
     c.refresh_token_expires_at = Some(1000);
+
     let response = |token: Option<&str>| {
         serde_json::from_value(serde_json::json!({"access_token":"access", "expires_in":3600,"scope":"https://mail.google.com/","refresh_token":token})).unwrap()
     };

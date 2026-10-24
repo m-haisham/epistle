@@ -1,3 +1,5 @@
+//! Scripted IMAP protocol and greeting regressions.
+
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use epistle_core::{Account, AccountConfig, AuthKind};
 use epistle_imap::Connection;

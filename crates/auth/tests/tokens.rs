@@ -1,3 +1,5 @@
+//! Provider exchange, encryption and token lifecycle regressions.
+
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[path = "../../../tests/support/mod.rs"]
 mod support;
@@ -10,6 +12,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+
 async fn fixture(
     kind: AuthKind,
 ) -> (
@@ -87,6 +90,7 @@ async fn fixture(
         .unwrap();
     (dir, provider, a, calls, task)
 }
+
 #[tokio::test]
 async fn concurrent_refresh_is_single_flight_and_rotation_is_durable() {
     let (_dir, provider, a, calls, task) = fixture(AuthKind::MicrosoftOauth).await;
@@ -122,6 +126,7 @@ async fn concurrent_refresh_is_single_flight_and_rotation_is_durable() {
     );
     task.abort();
 }
+
 #[tokio::test]
 async fn pkce_signed_state_is_single_use_and_revision_bound() {
     let (_dir, provider, a, _calls, task) = fixture(AuthKind::MicrosoftOauth).await;
@@ -213,10 +218,16 @@ async fn callback_activation_and_credentials_roll_back_together() {
         .unwrap()
         .1
         .into_owned();
-    provider.store.write(|c| Box::pin(async move {
-        sqlx::query("CREATE TRIGGER fail_activation BEFORE INSERT ON connection_events BEGIN SELECT RAISE(ABORT,'injected activation crash'); END").execute(c).await?;
-        Ok(())
-    })).await.unwrap();
+    provider
+        .store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query("CREATE TRIGGER fail_activation BEFORE INSERT ON connection_events BEGIN SELECT RAISE(ABORT,'injected activation crash'); END").execute(c).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     assert!(provider.callback(&state, "code").await.is_err());
     assert_eq!(
         provider.load("a").await.unwrap().refresh_token.as_deref(),

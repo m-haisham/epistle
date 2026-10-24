@@ -1,6 +1,10 @@
+//! MIME parsing and file extraction with raw-message fallback.
+
 use epistle_core::{Message, Pointer};
 use epistle_delivery::FileDraft;
 use serde_json::json;
+
+/// Parses an email, retaining raw bytes when MIME decoding fails.
 pub fn parse_message(
     id: String,
     p: &Pointer,
@@ -25,6 +29,7 @@ pub fn parse_message(
         files: vec![],
     };
     let mut files = vec![];
+
     if let Some(m) = mail_parser::MessageParser::default().parse(&raw) {
         // Adapted from Hark's src/imap/body.rs: retain groups, resent envelopes,
         // sender and threading headers while keeping attachment bytes off the wire.
@@ -34,6 +39,7 @@ pub fn parse_message(
                 mail_parser::Address::Group(g) => json!({"name":g.name(),"members":g.mailboxes().map(|m|json!({"name":m.name(),"address":m.address()})).collect::<Vec<_>>()})
             }).collect::<Vec<_>>()).unwrap_or_default())
         }
+
         let resent = if m.resent_from().is_some()
             || m.resent_to().is_some()
             || m.resent_message_id().is_some()
@@ -53,6 +59,7 @@ pub fn parse_message(
                 .collect::<Vec<_>>()
         );
         result.parse_error = m.parts().any(|part| part.has_problems());
+
         for (role, body, mime, name) in [
             (
                 "text",
@@ -125,6 +132,7 @@ pub fn parse_message(
 
 fn join_bodies<'a>(bodies: impl Iterator<Item = std::borrow::Cow<'a, str>>) -> Option<String> {
     let parts: Vec<_> = bodies.collect();
+
     if parts.is_empty() {
         None
     } else {
@@ -152,9 +160,10 @@ mod tests {
             internal_date: 100,
         }
     }
+
     #[test]
     fn mime_attachments_and_oversized_body_have_manifests_not_inline_bytes() {
-        let raw=b"From: Sender <s@example.test>\r\nTo: t@example.test\r\nSubject: Test\r\nMessage-ID: <test@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=abc\r\n\r\n--abc\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--abc\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=test.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--abc--\r\n";
+        let raw = b"From: Sender <s@example.test>\r\nTo: t@example.test\r\nSubject: Test\r\nMessage-ID: <test@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=abc\r\n\r\n--abc\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--abc\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=test.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--abc--\r\n";
         let (message, files) =
             parse_message("m".into(), &pointer(), raw.to_vec(), "live".into(), None, 4);
         assert_eq!(
@@ -174,6 +183,7 @@ mod tests {
         );
         assert!(files.iter().any(|f| f.role == "raw" && f.bytes == raw));
     }
+
     #[test]
     fn unparseable_mail_still_delivers_raw() {
         let (message, files) =
@@ -188,7 +198,7 @@ mod hark_regressions {
     use super::*;
     #[test]
     fn groups_resent_threading_and_all_body_parts_survive() {
-        let raw=b"From: Sender <s@example.test>\r\nSender: sender@example.test\r\nTo: Team: Alice <a@example.test>, Bob <b@example.test>;\r\nResent-From: relay@example.test\r\nResent-To: destination@example.test\r\nResent-Message-ID: <resent@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nfirst part\r\n--x\r\nContent-Type: text/plain\r\n\r\nsecond part\r\n--x--\r\n";
+        let raw = b"From: Sender <s@example.test>\r\nSender: sender@example.test\r\nTo: Team: Alice <a@example.test>, Bob <b@example.test>;\r\nResent-From: relay@example.test\r\nResent-To: destination@example.test\r\nResent-Message-ID: <resent@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nfirst part\r\n--x\r\nContent-Type: text/plain\r\n\r\nsecond part\r\n--x--\r\n";
         let p = Pointer {
             account_id: "a".into(),
             folder_id: "f".into(),

@@ -1,8 +1,11 @@
+//! Transactional discovery, deduplication and delivery handoff.
+
 use epistle_core::{Pointer, hash, id, now};
 use epistle_delivery::Prepared;
 use epistle_store::{Error, Store};
 use sqlx::{Row, SqliteConnection};
-// Caller owns the transaction, so discovery and cursor movement are one durable change.
+
+/// Queues discovery within the caller’s cursor transaction.
 pub async fn enqueue(
     c: &mut SqliteConnection,
     p: &Pointer,
@@ -25,7 +28,17 @@ message_index(message_key,account_id,folder_id,uidvalidity,uid,rfc_message_id,po
 VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(message_key) DO UPDATE SET
 folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,rfc_message_id=excluded.rfc_message_id,pointer=excluded.pointer,created_at=excluded.created_at
 ")
- .bind(&key).bind(&p.account_id).bind(&p.folder_id).bind(p.uidvalidity).bind(p.uid).bind(&p.rfc_message_id).bind(&pointer).bind(now()).execute(&mut *c).await?;
+        .bind(&key)
+        .bind(&p.account_id)
+        .bind(&p.folder_id)
+        .bind(p.uidvalidity)
+        .bind(p.uid)
+        .bind(&p.rfc_message_id)
+        .bind(&pointer)
+        .bind(now())
+        .execute(&mut *c)
+        .await?;
+
     if existing.is_some() && !redeliver {
         // A seen identity is not necessarily delivered: it may have moved while
         // its original location was being fetched. Preserve the public ID and
@@ -34,6 +47,7 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
             .bind(&key)
             .fetch_one(&mut *c)
             .await?;
+
         if handed_off > 0 {
             return Ok(false);
         }
@@ -46,6 +60,7 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
         {
             let stub: String = row.try_get("id")?;
             let state: String = row.try_get("state")?;
+
             if state == "pending" {
                 sqlx::query(
                     "UPDATE fetch_queue SET pointer=?,next_attempt_at=0 WHERE id=? AND pointer!=?",
@@ -55,6 +70,7 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
                 .bind(&pointer)
                 .execute(c)
                 .await?;
+
                 return Ok(false);
             }
             sqlx::query(
@@ -67,9 +83,11 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
             .bind(stub)
             .execute(c)
             .await?;
+
             return Ok(true);
         }
     }
+
     let idem = if redeliver {
         format!("{}:{}", p.key(), job.unwrap_or("live"))
     } else {
@@ -94,9 +112,18 @@ VALUES(?,?,?,?,?,?,?,?)
     .await?
     .rows_affected()
         > 0;
-    sqlx::query("INSERT OR IGNORE INTO seen(account_id,message_id_hash,message_key,first_seen_at) VALUES(?,?,?,?)").bind(&p.account_id).bind(identity).bind(key).bind(now()).execute(c).await?;
+    sqlx::query("INSERT OR IGNORE INTO seen(account_id,message_id_hash,message_key,first_seen_at) VALUES(?,?,?,?)")
+        .bind(&p.account_id)
+        .bind(identity)
+        .bind(key)
+        .bind(now())
+        .execute(c)
+        .await?;
+
     Ok(inserted)
 }
+
+/// Atomically replaces a fetch stub with its durable delivery payload.
 pub async fn handoff(store: &Store, stub: String, prepared: Prepared) -> Result<(), Error> {
     store
         .write(move |c| {
@@ -132,6 +159,7 @@ CONFLICT(id) DO UPDATE SET payload_path=excluded.payload_path,expired=0,expires_
                 .bind(key)
                 .execute(&mut *c)
                 .await?;
+
                 for f in prepared.files {
                     let m = f.manifest;
                     sqlx::query(
@@ -179,6 +207,7 @@ VALUES(?,?,?,'email.message.received',?,?,?,?)
                     .bind(stub)
                     .execute(c)
                     .await?;
+
                 Ok(())
             })
         })
