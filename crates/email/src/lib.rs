@@ -232,7 +232,10 @@ impl Service {
         }
     }
     async fn remind(&self, a: &Account, cancel: &CancellationToken) {
-        while self.config.reauth_reminder_secs > 0 {
+        if self.config.reauth_reminder_secs <= 0 {
+            return;
+        }
+        loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(Duration::from_secs(self.config.reauth_reminder_secs as u64)) => {}

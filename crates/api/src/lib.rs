@@ -222,12 +222,16 @@ pub fn router(state: AppState) -> axum::Router {
     }
     router
         .route("/openapi.json", axum::routing::get(openapi))
+        .route("/scalar", axum::routing::get(scalar))
         .layer(Extension(Arc::new(document)))
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
 }
 async fn openapi(Extension(api): Extension<Arc<Value>>) -> Json<Value> {
     Json((*api).clone())
+}
+async fn scalar() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("scalar.html"))
 }
 async fn authenticate(State(s): State<AppState>, request: Request, next: Next) -> Response {
     let key = request
@@ -510,10 +514,15 @@ struct Callback {
     code: Option<String>,
     error: Option<String>,
 }
+#[derive(Serialize, JsonSchema)]
+struct CallbackResult {
+    account_id: String,
+    status: String,
+}
 async fn callback(
     State(s): State<AppState>,
     Query(q): Query<Callback>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<CallbackResult>, ApiError> {
     if q.error.is_some() {
         return Err(ApiError::bad("authorization_denied"));
     }
@@ -526,7 +535,10 @@ async fn callback(
                 .ok_or_else(|| ApiError::bad("code_required"))?,
         )
         .await?;
-    Ok(Json(json!({"account_id":account,"status":"connecting"})))
+    Ok(Json(CallbackResult {
+        account_id: account,
+        status: "connecting".into(),
+    }))
 }
 async fn get_message(
     State(s): State<AppState>,
@@ -862,7 +874,31 @@ message_key=?)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn health(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[derive(Serialize, JsonSchema)]
+struct FolderError {
+    id: String,
+    reason: String,
+}
+#[derive(Serialize, JsonSchema)]
+struct AccountHealth {
+    id: String,
+    status: String,
+    last_success_at: Option<i64>,
+    lag_seconds: i64,
+    /// Provider-reported Unix deadline; null means unknown.
+    refresh_token_expires_at: Option<i64>,
+    folder_errors: Vec<FolderError>,
+}
+#[derive(Serialize, JsonSchema)]
+struct HealthResponse {
+    status: String,
+    accounts: Vec<AccountHealth>,
+    outbox_depth: i64,
+    oldest_pending_age_seconds: Option<i64>,
+    dead_deliveries: i64,
+    dead_fetches: i64,
+}
+async fn health(State(s): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let r = sqlx::query(
         "
 SELECT COUNT(*) AS depth,MIN(CASE WHEN state='pending' THEN created_at END) AS
@@ -887,14 +923,31 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
         .fetch_optional(&s.store.reads)
         .await?
         .flatten();
-        account_health.push(json!({"id":a.id,"status":a.status,"last_success_at":a.last_success_at,"lag_seconds":oldest.map(|t|now()-t).unwrap_or(0),"refresh_token_expires_at":refresh_expires_at}));
+        let folder_errors: Vec<(String,String)> = sqlx::query_as("SELECT id,last_error FROM folders WHERE account_id=? AND last_error IS NOT NULL ORDER BY id")
+            .bind(&a.id).fetch_all(&s.store.reads).await?;
+        account_health.push(AccountHealth {
+            id: a.id,
+            status: a.status,
+            last_success_at: a.last_success_at,
+            lag_seconds: oldest.map(|t| now() - t).unwrap_or(0),
+            refresh_token_expires_at: refresh_expires_at,
+            folder_errors: folder_errors
+                .into_iter()
+                .map(|(id, reason)| FolderError { id, reason })
+                .collect(),
+        });
     }
     let dead_fetch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fetch_queue WHERE state='dead'")
         .fetch_one(&s.store.reads)
         .await?;
-    Ok(Json(
-        json!({"status":"ok","accounts":account_health,"outbox_depth":r.try_get::<i64,_>("depth")?,"oldest_pending_age_seconds":r.try_get::<Option<i64>,_>("oldest")?.map(|t|now()-t),"dead_deliveries":r.try_get::<Option<i64>,_>("dead")?.unwrap_or(0),"dead_fetches":dead_fetch}),
-    ))
+    Ok(Json(HealthResponse {
+        status: "ok".into(),
+        accounts: account_health,
+        outbox_depth: r.try_get("depth")?,
+        oldest_pending_age_seconds: r.try_get::<Option<i64>, _>("oldest")?.map(|t| now() - t),
+        dead_deliveries: r.try_get::<Option<i64>, _>("dead")?.unwrap_or(0),
+        dead_fetches: dead_fetch,
+    }))
 }
 
 pub fn byte_range(value: &str, size: u64) -> Result<(u64, u64), ApiError> {
@@ -1036,5 +1089,115 @@ mod tests {
             assert!(byte_range(value, 10).is_err());
         }
         assert!(byte_range("bytes=0-", 0).is_err());
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/support/mod.rs"]
+mod support;
+
+#[cfg(test)]
+mod reference_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn scalar_and_openapi_are_public_but_operations_require_bearer_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(support::config(dir.path()));
+        let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
+        let app = router(AppState {
+            tokens: TokenProvider::new(store.clone(), config.clone()).unwrap(),
+            store,
+            config: config.clone(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/scalar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("url: '/openapi.json'"));
+        assert!(html.contains("Scalar.createApiReference"));
+        assert!(!html.contains(&config.api_key));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let schema: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1_048_576)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            schema.pointer("/paths/~1health/get/security"),
+            Some(&json!([{"apiKey":[]}]))
+        );
+        assert!(
+            schema
+                .pointer("/components/schemas/HealthResponse/properties/dead_fetches")
+                .is_some()
+        );
+        assert!(
+            schema
+                .pointer("/components/schemas/AccountHealth/properties/folder_errors")
+                .is_some()
+        );
+        assert!(
+            schema
+                .pointer("/paths/~1oauth~1callback/get/security")
+                .is_none()
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", config.api_key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Epistle API Reference</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>Enable JavaScript to view the API reference, or download <a href="/openapi.json">the OpenAPI schema</a>.</noscript>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.76.0"
+      integrity="sha384-oH1C0RwqcwbVXkC+r8A+4qRoyEUQdtxAzOwumkxZtQBBcsy61FOoPt7B50OVJYYQ"
+      crossorigin="anonymous"></script>
+    <script>
+      Scalar.createApiReference('#app', {
+        url: '/openapi.json',
+        servers: [{ url: window.location.origin }],
+        proxyUrl: '',
+        persistAuth: false,
+        telemetry: false,
+        hideClientButton: true,
+      });
+    </script>
+  </body>
+</html>
