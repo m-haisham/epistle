@@ -142,11 +142,38 @@ impl Connection {
                 Box::new(tcp)
             };
             let mut client = async_imap::Client::new(stream);
-            client
+            // Every IMAP server sends an initial greeting, including Gmail and
+            // Exchange. Client::new does not consume it (Hark did this for Gmail).
+            let greeting = client
                 .read_response()
                 .await
                 .map_err(|_| Error::transient("connection_lost"))?
                 .ok_or(Error::transient("connection_lost"))?;
+            match greeting.parsed() {
+                imap_proto::Response::Data {
+                    status: imap_proto::Status::Ok,
+                    ..
+                } => {}
+                imap_proto::Response::Data {
+                    status: imap_proto::Status::Bye,
+                    ..
+                } => {
+                    return Err(Error::transient("provider_outage"));
+                }
+                imap_proto::Response::Data {
+                    status: imap_proto::Status::PreAuth,
+                    ..
+                } => {
+                    // async-imap has no public Client -> preauthenticated Session
+                    // conversion. Refuse this unsupported mode without sending credentials.
+                    return Err(Error {
+                        reason: "preauthenticated_connection_unsupported",
+                        permanent: true,
+                        auth: false,
+                    });
+                }
+                _ => return Err(Error::transient("invalid_greeting")),
+            }
             let mut session = if password {
                 client.login(&a.email, secret.expose_secret()).await
             } else {
