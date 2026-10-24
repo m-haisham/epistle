@@ -33,7 +33,7 @@ Reviewed on 2026-10-25 against `docs/spec.md`. The original specification remain
 | Delivery and file lifecycle | Stable idempotency keys, HMAC, ordered groups, independent concurrent delivery, retry/dead/replay/discard, immutable generations, ack-based retention, pressure eviction and startup orphan cleanup; transaction-boundary and HTTP/file tests. |
 | Status and operations | Atomic transition/event audit, sequence ordering, reauth parking/reminders, revision fencing, folder errors and health/dead counts; status and integration tests. |
 | HTTP and documentation | Required v1 routes, bearer auth, typed errors and response schemas, file range/ETag/410 behavior, generated OpenAPI and Scalar; API and integration tests. |
-| Packaging and configuration | `config` defaults/file/environment, SQLx migrations, pinned dependencies/toolchain, cargo-chef build, static distroless nonroot runtime, CI lint/tests/audit/deny. |
+| Packaging and configuration | `config` defaults/file/environment, SQLx migrations, pinned dependencies/toolchain, cargo-chef GNU/glibc build, distroless CC nonroot runtime, CI lint/tests/audit/deny. |
 
 ## Scope and operational boundaries
 
