@@ -110,7 +110,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
         config: config.clone(),
     };
 
-    for _ in 0..=config.max_attempts {
+    for _ in 0..=config.delivery.max_attempts {
         assert_eq!(store.account("a").await.unwrap().status, "active");
         assert_eq!(store.account("a").await.unwrap().revision, account.revision);
         assert!(matches!(
@@ -201,7 +201,7 @@ async fn restart_resumes_opt_in_reauth_reminders_without_reconnecting() {
     drop(store);
     let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
     let mut config = support::config(dir.path());
-    config.reauth_reminder_secs = 1;
+    config.auth.reauth_reminder_secs = 1;
     let config = Arc::new(config);
     let service = Service {
         tokens: TokenProvider::new(store.clone(), config.clone()).unwrap(),

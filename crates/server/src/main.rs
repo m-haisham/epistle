@@ -44,13 +44,16 @@ async fn main() {
 
 async fn run() -> Result<(), Error> {
     let mut config = Config::from_env()?;
-    tokio::fs::create_dir_all(&config.data_dir).await?;
-    config.data_dir = tokio::fs::canonicalize(&config.data_dir).await?;
+    tokio::fs::create_dir_all(&config.storage.data_dir).await?;
+    config.storage.data_dir = tokio::fs::canonicalize(&config.storage.data_dir).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))
-            .await?;
+        tokio::fs::set_permissions(
+            &config.storage.data_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await?;
     }
 
     let config = Arc::new(config);
@@ -59,14 +62,14 @@ async fn run() -> Result<(), Error> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(config.data_dir.join("instance.lock"))?;
+        .open(config.storage.data_dir.join("instance.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Error::Locked)?;
-    let store = Store::open(&config.data_dir.join("epistle.sqlite")).await?;
+    let store = Store::open(&config.storage.data_dir.join("epistle.sqlite")).await?;
     let tokens = TokenProvider::new(store.clone(), config.clone())?;
-    let files = FileStore::new(&config.data_dir);
+    let files = FileStore::new(&config.storage.data_dir);
     files.sweep(&store, &config, true).await?;
     let delivery = Delivery::new(store.clone(), config.clone())?;
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let listener = tokio::net::TcpListener::bind(config.server.bind_addr).await?;
 
     let cancel = CancellationToken::new();
     let mut tasks = tokio::task::JoinSet::new();

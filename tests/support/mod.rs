@@ -1,14 +1,48 @@
 //! Shared test configuration and account fixtures.
 
 #![allow(dead_code, clippy::unwrap_used)]
-use epistle_core::Config;
+use epistle_core::{
+    Config,
+    config::{
+        AuthConfig, DeliveryConfig, OAuthClientConfig, ServerConfig, StorageConfig, TestingConfig,
+    },
+};
 
 pub fn config(path: &std::path::Path) -> Config {
-    serde_json::from_value(serde_json::json!({
-  "data_dir":path,"bind_addr":"127.0.0.1:0","api_key":"a".repeat(32),"master_key":"01".repeat(32),"webhook_url":"http://127.0.0.1:1/webhook","webhook_secret":"b".repeat(32),"public_url":"http://localhost",
-  "file_retention_secs":7200,"inline_body_cap":262144,"index_retention_secs":2592000,"reconcile_secs":180,"watchdog_secs":60,"fetch_batch_count":50,"fetch_batch_bytes":26214400,"max_attempts":3,"allow_insecure_test_endpoints":true,"disk_reserve_bytes":0,"reauth_reminder_secs":0,
-  "google_client_id":"test-google","google_client_secret":"test-secret","microsoft_client_id":"test-microsoft","microsoft_client_secret":"test-secret","token_endpoint_override":null
- })).unwrap()
+    Config {
+        server: ServerConfig {
+            bind_addr: ([127, 0, 0, 1], 0).into(),
+            api_key: "a".repeat(32),
+            public_url: "http://localhost".into(),
+        },
+        storage: StorageConfig {
+            data_dir: path.into(),
+            disk_reserve_bytes: 0,
+            ..Default::default()
+        },
+        delivery: DeliveryConfig {
+            webhook_url: "http://127.0.0.1:1/webhook".into(),
+            webhook_secret: "b".repeat(32),
+            max_attempts: 3,
+        },
+        auth: AuthConfig {
+            master_key: "01".repeat(32),
+            google: OAuthClientConfig {
+                client_id: "test-google".into(),
+                client_secret: "test-secret".into(),
+            },
+            microsoft: OAuthClientConfig {
+                client_id: "test-microsoft".into(),
+                client_secret: "test-secret".into(),
+            },
+            ..Default::default()
+        },
+        testing: TestingConfig {
+            allow_insecure_endpoints: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 pub async fn account(
@@ -19,7 +53,8 @@ pub async fn account(
     store
         .write(move |c| {
             Box::pin(async move {
-                sqlx::query("INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at) VALUES('a','ref',?,'a@example.test','{}',0,0)").bind(encoded).execute(c).await?;
+                sqlx::query("INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at) VALUES('a','ref',?,'a@example.test','{}',0,0)")
+                    .bind(encoded).execute(c).await?;
                 Ok(())
             })
         })

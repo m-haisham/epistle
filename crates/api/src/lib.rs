@@ -159,7 +159,7 @@ pub fn router(state: AppState) -> axum::Router {
         info: Info {
             title: "Epistle Email API".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            description: Some("Transport-neutral single-tenant email API. Authenticate with Authorization: Bearer <API_KEY>. Webhook signatures use HMAC-SHA256 over timestamp + '.' + exact request bytes.".into()),
+            description: Some("Transport-neutral single-tenant email API. Authenticate with Authorization: Bearer <EPISTLE_SERVER__API_KEY>. Webhook signatures use HMAC-SHA256 over timestamp + '.' + exact request bytes.".into()),
             ..Default::default()
         },
         ..Default::default()
@@ -302,7 +302,7 @@ async fn authenticate(State(s): State<AppState>, request: Request, next: Next) -
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
     let got = Sha256::digest(key.as_bytes());
-    let expected = Sha256::digest(s.config.api_key.as_bytes());
+    let expected = Sha256::digest(s.config.server.api_key.as_bytes());
 
     if !bool::from(got.as_slice().ct_eq(expected.as_slice())) {
         return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -376,7 +376,7 @@ async fn create_account(
         return Err(ApiError::bad("invalid_account"));
     }
     body.config
-        .normalize(body.auth_kind, s.config.allow_insecure)
+        .normalize(body.auth_kind, s.config.testing.allow_insecure_endpoints)
         .map_err(|e| ApiError::bad(e.to_string()))?;
     let credentials = zeroize::Zeroizing::new(Credentials::from(body.credentials));
     validate_credentials(body.auth_kind, &credentials)?;
@@ -576,7 +576,7 @@ async fn remove_account(
         .await?;
 
     for mid in mids {
-        let path = s.config.data_dir.join("files").join(mid);
+        let path = s.config.storage.data_dir.join("files").join(mid);
 
         match tokio::fs::remove_dir_all(path).await {
             Ok(()) => {}
@@ -944,7 +944,7 @@ seq=? AND state='dead'
 }
 
 async fn discard(State(s): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, ApiError> {
-    let retention = s.config.file_retention_secs;
+    let retention = s.config.storage.file_retention_secs;
     s.store
         .write(move |c| {
             Box::pin(async move {
@@ -1283,7 +1283,7 @@ mod reference_tests {
         .unwrap();
         assert!(html.contains("url: '/openapi.json'"));
         assert!(html.contains("Scalar.createApiReference"));
-        assert!(!html.contains(&config.api_key));
+        assert!(!html.contains(&config.server.api_key));
 
         let response = app
             .clone()
@@ -1338,7 +1338,10 @@ mod reference_tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", config.api_key))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", config.server.api_key),
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )

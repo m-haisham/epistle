@@ -76,7 +76,7 @@ async fn fixture(
         axum::serve(listener, app).await.unwrap();
     });
     let mut config = support::config(dir.path());
-    config.token_endpoint_override = Some(endpoint);
+    config.testing.token_endpoint_override = Some(endpoint);
     let provider = TokenProvider::new(store, Arc::new(config)).unwrap();
     provider
         .save(

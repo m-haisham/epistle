@@ -1,17 +1,44 @@
-# Defaults < optional epistle.toml < environment variables (uppercase field names).
-data_dir = "./data"
+# Defaults < optional epistle.toml < environment overrides.
+# Use __ between nested environment keys, e.g. EPISTLE_SERVER__BIND_ADDR.
+# Supply secrets through the environment; configure provider clients only when used.
+
+[server]
 bind_addr = "127.0.0.1:8080"
 public_url = "https://email.example.com"
-webhook_url = "https://app.example.com/webhooks/email"
-# Set API_KEY, MASTER_KEY (32 random bytes as hex), and WEBHOOK_SECRET in the environment.
-file_retention_secs = 7200
-inline_body_cap = 262144
-index_retention_secs = 2592000
+# EPISTLE_SERVER__API_KEY: at least 32 characters.
+
+[storage]
+data_dir = "./data"
+file_retention_secs = 7_200       # 2 hours after delivery acknowledgment
+index_retention_secs = 2_592_000  # 30 days
+disk_reserve_bytes = 268_435_456  # 256 MiB
+
+[mail]
 reconcile_secs = 180
 watchdog_secs = 60
-fetch_batch_count = 50
-fetch_batch_bytes = 26214400
+inline_body_cap = 262_144        # 256 KiB per combined text/HTML body
+
+[mail.fetch]
+batch_count = 50
+batch_bytes = 26_214_400         # 25 MiB; not a per-message size limit
+
+[delivery]
+webhook_url = "https://app.example.com/webhooks/email"
 max_attempts = 12
-disk_reserve_bytes = 268435456
-reauth_reminder_secs = 0
-allow_insecure_test_endpoints = false
+# EPISTLE_DELIVERY__WEBHOOK_SECRET: at least 32 characters.
+
+[auth]
+reauth_reminder_secs = 0         # Disabled
+# EPISTLE_AUTH__MASTER_KEY: 32 random bytes encoded as 64 hex characters.
+
+[auth.google]
+# EPISTLE_AUTH__GOOGLE__CLIENT_ID
+# EPISTLE_AUTH__GOOGLE__CLIENT_SECRET
+
+[auth.microsoft]
+# EPISTLE_AUTH__MICROSOFT__CLIENT_ID
+# EPISTLE_AUTH__MICROSOFT__CLIENT_SECRET
+
+[testing]
+allow_insecure_endpoints = false
+# token_endpoint_override = "http://localhost:8090/token"

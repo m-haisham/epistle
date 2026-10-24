@@ -138,7 +138,7 @@ impl FileStore {
     /// Expires eligible files and removes startup orphans.
     pub async fn sweep(&self, store: &Store, config: &Config, startup: bool) -> Result<(), Error> {
         tokio::fs::create_dir_all(&self.root).await?;
-        let pressure = fs2::available_space(&self.root)? < config.disk_reserve_bytes;
+        let pressure = fs2::available_space(&self.root)? < config.storage.disk_reserve_bytes;
 
         let rows = sqlx::query(
             "
@@ -251,7 +251,7 @@ outbox.message_key=message_payloads.message_key)
             }
         }
 
-        let cutoff = now() - config.index_retention_secs;
+        let cutoff = now() - config.storage.index_retention_secs;
         store
             .write(move |c| {
                 Box::pin(async move {
@@ -461,11 +461,11 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
             }
         };
         let timestamp = now();
-        let sig = signature(&self.config.webhook_secret, timestamp, &body)?;
+        let sig = signature(&self.config.delivery.webhook_secret, timestamp, &body)?;
 
         let response = self
             .client
-            .post(&self.config.webhook_url)
+            .post(&self.config.delivery.webhook_url)
             .header("content-type", "application/json")
             .header("x-epistle-timestamp", timestamp.to_string())
             .header("x-epistle-signature", sig)
@@ -477,7 +477,7 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
         let status = response.as_ref().ok().map(|r| r.status().as_u16());
 
         if status.is_some_and(|s| (200..300).contains(&s)) {
-            let retention = self.config.file_retention_secs;
+            let retention = self.config.storage.file_retention_secs;
             let backfill_id: Option<String> = row.try_get("backfill_id")?;
             self.store
                 .write(move |c| {
@@ -564,7 +564,7 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
         retryable: bool,
         delay: Option<i64>,
     ) -> Result<(), Error> {
-        let dead = !retryable || attempts >= self.config.max_attempts;
+        let dead = !retryable || attempts >= self.config.delivery.max_attempts;
         let delay = delay.unwrap_or_else(|| backoff(attempts));
         tracing::warn!(
             delivery_id = seq,

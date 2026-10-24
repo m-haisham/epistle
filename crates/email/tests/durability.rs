@@ -212,8 +212,8 @@ async fn dead_and_retrying_deliveries_retain_files_ack_starts_expiry() {
         axum::serve(listener, app).await.unwrap();
     });
     let mut config = support::config(dir.path());
-    config.webhook_url = url;
-    config.file_retention_secs = 1;
+    config.delivery.webhook_url = url;
+    config.storage.file_retention_secs = 1;
     let config = Arc::new(config);
     let delivery = Delivery::new(store.clone(), config.clone()).unwrap();
     delivery.tick().await.unwrap();
@@ -387,7 +387,7 @@ async fn missing_payload_is_dead_and_does_not_abort_independent_deliveries() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = support::config(dir.path());
-    config.webhook_url = format!("http://{}/webhook", listener.local_addr().unwrap());
+    config.delivery.webhook_url = format!("http://{}/webhook", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -434,7 +434,7 @@ async fn failed_ack_does_not_cancel_slow_independent_delivery() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = support::config(dir.path());
-    config.webhook_url = format!("http://{}/webhook", listener.local_addr().unwrap());
+    config.delivery.webhook_url = format!("http://{}/webhook", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -475,7 +475,7 @@ async fn pressure_eviction_commits_tombstone_before_unlink_and_restart_cleans_or
         .await
         .unwrap();
     let mut config = support::config(dir.path());
-    config.disk_reserve_bytes = u64::MAX;
+    config.storage.disk_reserve_bytes = u64::MAX;
     assert!(files.sweep(&store, &config, false).await.is_err());
     assert!(
         std::path::Path::new(&path).exists(),
@@ -501,7 +501,7 @@ async fn pressure_eviction_commits_tombstone_before_unlink_and_restart_cleans_or
         })
         .await
         .unwrap();
-    config.disk_reserve_bytes = 0;
+    config.storage.disk_reserve_bytes = 0;
     let restarted = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
     files.sweep(&restarted, &config, true).await.unwrap();
     assert!(!std::path::Path::new(&path).exists());
@@ -539,7 +539,7 @@ async fn graceful_delivery_stop_commits_ack_and_preserves_the_next_event() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = support::config(dir.path());
-    config.webhook_url = format!("http://{}/", listener.local_addr().unwrap());
+    config.delivery.webhook_url = format!("http://{}/", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let delivery = Delivery::new(store.clone(), Arc::new(config)).unwrap();
     let stop = CancellationToken::new();

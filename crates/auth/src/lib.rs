@@ -202,7 +202,7 @@ struct TokenResponse {
 impl TokenProvider {
     /// Builds credential storage and a bounded provider HTTP client.
     pub fn new(store: Store, config: Arc<Config>) -> Result<Self, Error> {
-        let vault = Vault::new(&config.master_key)?;
+        let vault = Vault::new(&config.auth.master_key)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
@@ -398,6 +398,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
 
     fn endpoint(&self, a: &Account) -> String {
         self.config
+            .testing
             .token_endpoint_override
             .clone()
             .unwrap_or_else(|| {
@@ -424,13 +425,13 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
     fn client_credentials(&self, kind: AuthKind) -> Result<(String, String), Error> {
         let (id, secret) = if kind == AuthKind::MicrosoftOauth {
             (
-                &self.config.microsoft_client_id,
-                &self.config.microsoft_client_secret,
+                &self.config.auth.microsoft.client_id,
+                &self.config.auth.microsoft.client_secret,
             )
         } else {
             (
-                &self.config.google_client_id,
-                &self.config.google_client_secret,
+                &self.config.auth.google.client_id,
+                &self.config.auth.google.client_secret,
             )
         };
 
@@ -526,9 +527,10 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         let (client, _) = self.client_credentials(a.auth_kind)?;
         let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
         let unsigned = format!("{}.{}.{}", a.id, now() + 600, nonce);
-        let mut mac =
-            <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(self.config.webhook_secret.as_bytes())
-                .map_err(|_| Error::Crypto)?;
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(
+            self.config.delivery.webhook_secret.as_bytes(),
+        )
+        .map_err(|_| Error::Crypto)?;
         mac.update(unsigned.as_bytes());
         let state = format!(
             "{unsigned}.{}",
@@ -586,7 +588,7 @@ VALUES(?,?,?,?,?)
                 "redirect_uri",
                 &format!(
                     "{}/oauth/callback",
-                    self.config.public_url.trim_end_matches('/')
+                    self.config.server.public_url.trim_end_matches('/')
                 ),
             ),
             ("response_type", "code"),
@@ -606,9 +608,10 @@ VALUES(?,?,?,?,?)
     #[tracing::instrument(skip_all, name = "oauth_callback")]
     pub async fn callback(&self, state: &str, code: &str) -> Result<String, Error> {
         let (unsigned, signature) = state.rsplit_once('.').ok_or(Error::State)?;
-        let mut mac =
-            <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(self.config.webhook_secret.as_bytes())
-                .map_err(|_| Error::Crypto)?;
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(
+            self.config.delivery.webhook_secret.as_bytes(),
+        )
+        .map_err(|_| Error::Crypto)?;
         mac.update(unsigned.as_bytes());
         mac.verify_slice(
             &URL_SAFE_NO_PAD
@@ -656,7 +659,7 @@ account_id,encrypted_verifier,revision
                 "redirect_uri",
                 format!(
                     "{}/oauth/callback",
-                    self.config.public_url.trim_end_matches('/')
+                    self.config.server.public_url.trim_end_matches('/')
                 ),
             ),
             (

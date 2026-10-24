@@ -55,15 +55,21 @@ impl Service {
         let access = self.tokens.get_access_token(a, false).await?;
         let recycle_at = access.recycle_at(&a.id);
 
-        match Connection::connect(a, access.secret, access.password, self.config.watchdog_secs)
-            .await
+        match Connection::connect(
+            a,
+            access.secret,
+            access.password,
+            self.config.mail.watchdog_secs,
+        )
+        .await
         {
             Ok(c) => Ok((c, recycle_at)),
             Err(e) if e.auth && a.auth_kind != epistle_core::AuthKind::Password => {
                 let access = self.tokens.get_access_token(a, true).await?;
                 let recycle_at = access.recycle_at(&a.id);
 
-                match Connection::connect(a, access.secret, false, self.config.watchdog_secs).await
+                match Connection::connect(a, access.secret, false, self.config.mail.watchdog_secs)
+                    .await
                 {
                     Ok(c) => Ok((c, recycle_at)),
                     Err(e) if e.auth => {
@@ -131,7 +137,7 @@ impl Service {
                     || panicked.contains(&a.id)
                     || accounts.contains_key(&a.id)
                     || a.status == "error"
-                    || (a.status == "needs_reauth" && self.config.reauth_reminder_secs <= 0)
+                    || (a.status == "needs_reauth" && self.config.auth.reauth_reminder_secs <= 0)
                 {
                     continue;
                 }
@@ -284,7 +290,7 @@ impl Service {
             tracing::warn!(account_id = %a.id, reason, failures, "account connection interrupted");
 
             if permanent {
-                if status == "needs_reauth" && self.config.reauth_reminder_secs > 0 {
+                if status == "needs_reauth" && self.config.auth.reauth_reminder_secs > 0 {
                     self.remind(&a, &cancel).await;
                 }
                 return;
@@ -304,13 +310,13 @@ impl Service {
     }
 
     async fn remind(&self, a: &Account, cancel: &CancellationToken) {
-        if self.config.reauth_reminder_secs <= 0 {
+        if self.config.auth.reauth_reminder_secs <= 0 {
             return;
         }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(self.config.reauth_reminder_secs as u64)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(self.config.auth.reauth_reminder_secs as u64)) => {}
             }
 
             let Ok(current) = self.store.account(&a.id).await else {

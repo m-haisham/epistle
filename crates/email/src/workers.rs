@@ -219,6 +219,7 @@ VALUES(?,?,?,?,?,?,?)
 
             let seconds = self
                 .config
+                .mail
                 .reconcile_secs
                 .min((recycle_at - now()).max(1) as u64);
 
@@ -281,7 +282,7 @@ ORDER BY created_at,id LIMIT ?
             )
             .bind(&a.id)
             .bind(now())
-            .bind(self.config.fetch_batch_count as i64)
+            .bind(self.config.mail.fetch.batch_count as i64)
             .fetch_all(&self.store.reads)
             .await?;
 
@@ -327,7 +328,7 @@ ORDER BY created_at,id LIMIT ?
                 let original_pointer: String = row.try_get("pointer")?;
                 let p: Pointer = serde_json::from_str(&original_pointer)?;
 
-                if bytes > 0 && bytes + p.size > self.config.fetch_batch_bytes {
+                if bytes > 0 && bytes + p.size > self.config.mail.fetch.batch_bytes {
                     break;
                 }
                 bytes += p.size;
@@ -365,7 +366,7 @@ ORDER BY created_at,id LIMIT ?
                     let mid: String = row.try_get("message_key")?;
                     let origin: String = row.try_get("origin")?;
                     let job: Option<String> = row.try_get("backfill_id")?;
-                    let cap = self.config.inline_body_cap;
+                    let cap = self.config.mail.inline_body_cap;
                     let p = resolved.clone();
                     let parsed = tokio::task::spawn_blocking(move || {
                         parse_message(mid, &p, raw, origin, job, cap)

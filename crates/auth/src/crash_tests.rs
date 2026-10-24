@@ -143,7 +143,7 @@ impl Server {
 async fn provider(dir: &std::path::Path, endpoint: &str) -> TokenProvider {
     let store = Store::open(&dir.join("test.sqlite")).await.unwrap();
     let mut config = support::config(dir);
-    config.token_endpoint_override = Some(endpoint.into());
+    config.testing.token_endpoint_override = Some(endpoint.into());
     TokenProvider::new(store, Arc::new(config)).unwrap()
 }
 
