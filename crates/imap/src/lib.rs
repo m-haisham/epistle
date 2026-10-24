@@ -1,5 +1,5 @@
 use epistle_core::{Account, Pointer};
-use futures::TryStreamExt;
+use imap_proto::{AttributeValue, MailboxDatum, Response, Status};
 use secrecy::{ExposeSecret, SecretString};
 use std::{fmt::Debug, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -44,13 +44,18 @@ impl From<async_imap::error::Error> for Error {
                     Self::transient("provider_outage")
                 } else if u.contains("[LIMIT]") || u.contains("[OVERQUOTA]") {
                     Self::transient("rate_limited")
-                } else if u.contains("[NONEXISTENT]") {
+                } else if u.contains("[NONEXISTENT]")
+                    // Older Dovecot IMAP4rev1 responses omit NONEXISTENT.
+                    || u.contains("MAILBOX DOESN'T EXIST:")
+                {
                     Self {
                         reason: "mailbox_missing",
                         permanent: true,
                         auth: false,
                     }
-                } else if u.contains("[ALERT]") && (u.contains("WEBALERT") || u.contains("LOGIN")) {
+                } else if (u.contains("[ALERT]") || u.contains("CODE: SOME(ALERT)"))
+                    && (u.contains("WEBALERT") || u.contains("LOGIN"))
+                {
                     Self {
                         reason: "account_locked",
                         permanent: true,
@@ -174,7 +179,7 @@ impl Connection {
                 }
                 _ => return Err(Error::transient("invalid_greeting")),
             }
-            let mut session = if password {
+            let session = if password {
                 client.login(&a.email, secret.expose_secret()).await
             } else {
                 client
@@ -199,19 +204,24 @@ impl Connection {
                 }
                 classified
             })?;
-            let caps = session.capabilities().await.map_err(Error::from)?;
-            if caps.has_str("ENABLE") && caps.has_str("CONDSTORE") {
-                session
-                    .run_command_and_check_ok("ENABLE CONDSTORE")
-                    .await
-                    .map_err(Error::from)?;
-            }
-            Ok(Self {
-                gmail: caps.has_str("X-GM-EXT-1"),
-                idle_supported: caps.has_str("IDLE"),
+            let mut connection = Self {
                 session,
+                gmail: false,
+                idle_supported: false,
                 timeout: duration,
-            })
+            };
+            let caps = connection.checked("CAPABILITY".into()).await?;
+            let has = |name: &str| {
+                caps.capabilities
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(name))
+            };
+            connection.gmail = has("X-GM-EXT-1");
+            connection.idle_supported = has("IDLE");
+            if has("ENABLE") && has("CONDSTORE") {
+                connection.checked("ENABLE CONDSTORE".into()).await?;
+            }
+            Ok(connection)
         })
         .await
         .map_err(|_| Error::transient("server_unreachable"))?
@@ -220,33 +230,26 @@ impl Connection {
         if !a.config.folders.is_empty() {
             return Ok(a.config.folders.clone());
         }
-        let names = bounded(self.timeout, async {
-            self.session
-                .list(None, Some("*"))
-                .await?
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await?;
+        let names = self.checked("LIST \"\" \"*\"".into()).await?.mailboxes;
         if self.gmail {
             if let Some(all) = names.iter().find(|n| {
-                n.attributes()
+                n.name_attributes
                     .iter()
                     .any(|a| format!("{a:?}").eq_ignore_ascii_case("All"))
-                    || n.name().ends_with("/All Mail")
+                    || n.name.as_ref().ends_with("/All Mail")
             }) {
-                return Ok(vec![all.name().into()]);
+                return Ok(vec![all.name.as_ref().into()]);
             }
             return Ok(vec!["[Gmail]/All Mail".into()]);
         }
         let mut result = vec!["INBOX".into()];
         if let Some(sent) = names.iter().find(|n| {
-            n.attributes()
+            n.name_attributes
                 .iter()
                 .any(|a| format!("{a:?}").eq_ignore_ascii_case("Sent"))
-                || matches!(n.name(), "Sent" | "Sent Items" | "Sent Messages")
+                || matches!(n.name.as_ref(), "Sent" | "Sent Items" | "Sent Messages")
         }) {
-            result.push(sent.name().into());
+            result.push(sent.name.as_ref().into());
         }
         Ok(result)
     }
@@ -254,12 +257,77 @@ impl Connection {
         bounded(self.timeout, self.session.examine(folder)).await
     }
     pub async fn search(&mut self, query: &str) -> Result<Vec<u32>, Error> {
-        let mut ids: Vec<_> = bounded(self.timeout, self.session.uid_search(query))
-            .await?
-            .into_iter()
-            .collect();
+        let mut ids = self.checked(format!("UID SEARCH {query}")).await?.ids;
         ids.sort_unstable();
+        ids.dedup();
         Ok(ids)
+    }
+    /// Unlike async-imap's streaming helpers, check the tagged completion before
+    /// exposing partial data. A rejected command must never advance a cursor or
+    /// become a successful STORE / an empty successful FETCH.
+    async fn checked(&mut self, command: String) -> Result<Checked, Error> {
+        timeout(self.timeout, async {
+            let tag = self
+                .session
+                .run_command(command)
+                .await
+                .map_err(Error::from)?;
+            let mut responses = Checked::default();
+            loop {
+                let response = self
+                    .session
+                    .read_response()
+                    .await
+                    .map_err(|_| Error::transient("connection_lost"))?
+                    .ok_or_else(|| Error::transient("connection_lost"))?;
+                match response.parsed() {
+                    Response::Done {
+                        tag: got,
+                        status,
+                        outcome,
+                    } if *got == tag => {
+                        return if *status == Status::Ok {
+                            Ok(responses)
+                        } else {
+                            Err(Error::from(async_imap::error::Error::No(format!(
+                                "{outcome:?}"
+                            ))))
+                        };
+                    }
+                    Response::Data {
+                        status: Status::Bye,
+                        ..
+                    } => return Err(Error::transient("connection_lost")),
+                    Response::Fetch(_, attrs) => {
+                        responses.fetches.push(Fetched::from(attrs.as_slice()))
+                    }
+                    Response::MailboxData(MailboxDatum::Search(ids)) => {
+                        responses.ids.extend(ids.iter().copied())
+                    }
+                    Response::MailboxData(MailboxDatum::List(data)) => {
+                        responses.mailboxes.push(data.clone().into_owned())
+                    }
+                    Response::Capabilities(caps) => {
+                        responses.capabilities.extend(caps.iter().filter_map(|c| {
+                            if let imap_proto::Capability::Atom(atom) = c {
+                                Some(atom.to_string())
+                            } else {
+                                None
+                            }
+                        }))
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| Error::transient("connection_lost"))?
+    }
+    async fn fetch_data(&mut self, ids: &str, query: &str) -> Result<Vec<Fetched>, Error> {
+        Ok(self
+            .checked(format!("UID FETCH {ids} {query}"))
+            .await?
+            .fetches)
     }
     pub async fn metadata(
         &mut self,
@@ -270,88 +338,30 @@ impl Connection {
         ids: &str,
     ) -> Result<Vec<Pointer>, Error> {
         let query = if self.gmail {
-            "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE X-GM-MSGID X-GM-LABELS)"
+            "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE X-GM-MSGID X-GM-THRID X-GM-LABELS)"
         } else {
             "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE)"
         };
-        let fetched = bounded(self.timeout, async {
-            self.session
-                .uid_fetch(ids, query)
-                .await?
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await?;
-        let mut items = vec![];
-        for f in fetched {
-            let Some(uid) = f.uid else { continue };
-            let thread_id = if self.gmail {
-                self.thread_id(uid).await?
-            } else {
-                None
-            };
-            items.push(Pointer {
-                account_id: a.id.clone(),
-                folder_id: folder_id.into(),
-                folder: folder.into(),
-                uidvalidity: validity,
-                uid: i64::from(uid),
-                rfc_message_id: f
-                    .envelope()
-                    .and_then(|e| e.message_id.as_ref())
-                    .map(|s| String::from_utf8_lossy(s).into_owned()),
-                gmail_id: f.gmail_msg_id().map(ToString::to_string),
-                thread_id,
-                labels: f
-                    .gmail_labels()
-                    .map(|x| x.iter().map(ToString::to_string).collect())
-                    .unwrap_or_default(),
-                flags: f.flags().map(flag_string).collect(),
-                size: i64::from(f.size.unwrap_or(0)),
-                internal_date: f.internal_date().map(|d| d.timestamp()).unwrap_or(0),
-            });
-        }
-        Ok(items)
-    }
-    async fn thread_id(&mut self, uid: u32) -> Result<Option<String>, Error> {
-        use imap_proto::{AttributeValue, Response, Status};
-        timeout(self.timeout, async {
-            let tag = self
-                .session
-                .run_command(format!("UID FETCH {uid} (X-GM-THRID)"))
-                .await
-                .map_err(Error::from)?;
-            let mut thread = None;
-            loop {
-                let r = self
-                    .session
-                    .read_response()
-                    .await
-                    .map_err(|_| Error::transient("connection_lost"))?
-                    .ok_or(Error::transient("connection_lost"))?;
-                match r.parsed() {
-                    Response::Fetch(_, attrs) => {
-                        for attr in attrs {
-                            if let AttributeValue::GmailThrId(t) = attr {
-                                thread = Some(t.to_string());
-                            }
-                        }
-                    }
-                    Response::Done {
-                        tag: got, status, ..
-                    } if *got == tag => {
-                        return if *status == Status::Ok {
-                            Ok(thread)
-                        } else {
-                            Err(Error::transient("provider_outage"))
-                        };
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .map_err(|_| Error::transient("connection_lost"))?
+        let fetched = self.fetch_data(ids, query).await?;
+        Ok(fetched
+            .into_iter()
+            .filter_map(|f| {
+                Some(Pointer {
+                    account_id: a.id.clone(),
+                    folder_id: folder_id.into(),
+                    folder: folder.into(),
+                    uidvalidity: validity,
+                    uid: i64::from(f.uid?),
+                    rfc_message_id: f.message_id,
+                    gmail_id: f.gmail_id,
+                    thread_id: f.thread_id,
+                    labels: f.labels,
+                    flags: f.flags,
+                    size: f.size,
+                    internal_date: f.internal_date,
+                })
+            })
+            .collect())
     }
     pub async fn resolve(&mut self, p: &Pointer, write: bool) -> Result<Option<Pointer>, Error> {
         let mailbox = if write {
@@ -386,19 +396,10 @@ impl Connection {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
-                let candidates = bounded(self.timeout, async {
-                    self.session
-                        .uid_fetch(set, "(UID ENVELOPE)")
-                        .await?
-                        .try_collect::<Vec<_>>()
-                        .await
-                })
-                .await?;
+                let candidates = self.fetch_data(&set, "(UID ENVELOPE)").await?;
                 exact = candidates
                     .iter()
-                    .find(|f| {
-                        f.envelope().and_then(|e| e.message_id.as_deref()) == Some(mid.as_bytes())
-                    })
+                    .find(|f| f.message_id.as_deref() == Some(mid.as_str()))
                     .and_then(|f| f.uid);
                 if exact.is_some() {
                     break;
@@ -414,18 +415,13 @@ impl Connection {
         let Some(p) = self.resolve(p, false).await? else {
             return Ok(None);
         };
-        let fetched = bounded(self.timeout, async {
-            self.session
-                .uid_fetch(p.uid.to_string(), "(UID BODY.PEEK[])")
-                .await?
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await?;
+        let fetched = self
+            .fetch_data(&p.uid.to_string(), "(UID BODY.PEEK[])")
+            .await?;
         Ok(fetched
             .into_iter()
             .find(|f| f.uid.map(i64::from) == Some(p.uid))
-            .and_then(|f| f.body().map(|b| (p, b.to_vec()))))
+            .and_then(|f| f.body.map(|b| (p, b))))
     }
     pub async fn mark_read(&mut self, p: &Pointer, read: bool) -> Result<Option<Pointer>, Error> {
         let Some(p) = self.resolve(p, true).await? else {
@@ -439,14 +435,7 @@ impl Connection {
         } else {
             "-FLAGS.SILENT (\\Seen)"
         };
-        bounded(self.timeout, async {
-            self.session
-                .uid_store(p.uid.to_string(), cmd)
-                .await?
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await?;
+        self.checked(format!("UID STORE {} {cmd}", p.uid)).await?;
         Ok(Some(p))
     }
     pub async fn idle(self, seconds: u64) -> Result<Self, Error> {
@@ -495,12 +484,62 @@ pub fn quote(s: &str) -> Result<String, Error> {
     ))
 }
 
-fn flag_string(f: async_imap::types::Flag<'_>) -> String {
-    use async_imap::types::Flag;
-    match f {
-        Flag::Custom(s) => s.into_owned(),
-        Flag::MayCreate => "\\*".into(),
-        other => format!("\\{other:?}"),
+#[derive(Default)]
+struct Checked {
+    fetches: Vec<Fetched>,
+    ids: Vec<u32>,
+    mailboxes: Vec<imap_proto::MailboxListData<'static>>,
+    capabilities: Vec<String>,
+}
+#[derive(Default)]
+struct Fetched {
+    uid: Option<u32>,
+    size: i64,
+    internal_date: i64,
+    message_id: Option<String>,
+    gmail_id: Option<String>,
+    thread_id: Option<String>,
+    labels: Vec<String>,
+    flags: Vec<String>,
+    body: Option<Vec<u8>>,
+}
+impl From<&[AttributeValue<'_>]> for Fetched {
+    fn from(attrs: &[AttributeValue<'_>]) -> Self {
+        let mut result = Self::default();
+        for attr in attrs {
+            match attr {
+                AttributeValue::Uid(uid) => result.uid = Some(*uid),
+                AttributeValue::Rfc822Size(size) => result.size = i64::from(*size),
+                AttributeValue::InternalDate(date) => {
+                    result.internal_date =
+                        chrono::DateTime::parse_from_str(date, "%d-%b-%Y %H:%M:%S %z")
+                            .map(|d| d.timestamp())
+                            .unwrap_or(0)
+                }
+                AttributeValue::Envelope(e) => {
+                    result.message_id = e
+                        .message_id
+                        .as_ref()
+                        .map(|m| String::from_utf8_lossy(m).into_owned())
+                }
+                AttributeValue::GmailMsgId(id) => result.gmail_id = Some(id.to_string()),
+                AttributeValue::GmailThrId(id) => result.thread_id = Some(id.to_string()),
+                AttributeValue::GmailLabels(labels) => {
+                    result.labels = labels.iter().map(ToString::to_string).collect()
+                }
+                AttributeValue::Flags(flags) => {
+                    result.flags = flags.iter().map(ToString::to_string).collect()
+                }
+                AttributeValue::BodySection {
+                    section: None,
+                    data: Some(body),
+                    ..
+                }
+                | AttributeValue::Rfc822(Some(body)) => result.body = Some(body.to_vec()),
+                _ => {}
+            }
+        }
+        result
     }
 }
 

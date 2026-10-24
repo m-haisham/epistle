@@ -8,7 +8,11 @@ use epistle_imap::Connection;
 use epistle_store::Store;
 pub use parse::parse_message;
 pub use queue::{enqueue, handoff};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 #[derive(Debug, Error)]
@@ -83,10 +87,12 @@ impl Service {
                     remove.push(id.clone());
                 }
             }
+            let mut panicked = HashSet::new();
             for id in remove {
                 if let Some((revision, stop, task)) = accounts.remove(&id) {
                     stop.cancel();
                     if task.await.is_err() {
+                        panicked.insert(id.clone());
                         let _ = self
                             .store
                             .status_for_revision(&id, revision, "error", Some("worker_panicked"), 0)
@@ -96,6 +102,7 @@ impl Service {
             }
             for a in all {
                 if !a.enabled
+                    || panicked.contains(&a.id)
                     || accounts.contains_key(&a.id)
                     || matches!(a.status.as_str(), "needs_reauth" | "error")
                 {
@@ -166,6 +173,10 @@ impl Service {
                 Error::Auth(epistle_auth::Error::Unconfigured | epistle_auth::Error::Data) => {
                     ("error", "invalid_configuration", true)
                 }
+                Error::Auth(epistle_auth::Error::Crypto) => {
+                    ("error", "credential_decryption_failed", true)
+                }
+                Error::Join(_) => ("error", "worker_panicked", true),
                 Error::Imap(e) if e.auth && failures >= 3 && now() - first_failure >= 120 => {
                     ("needs_reauth", e.reason, true)
                 }
@@ -211,3 +222,6 @@ impl Service {
         }
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;

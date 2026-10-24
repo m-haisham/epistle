@@ -1,5 +1,5 @@
 use crate::{Error, Service, enqueue, handoff, parse_message};
-use epistle_core::{Account, Pointer, backoff, id, now};
+use epistle_core::{Account, Pointer, id, now};
 use epistle_imap::Connection;
 use sqlx::Row;
 use std::time::{Duration, Instant};
@@ -14,8 +14,26 @@ impl Service {
                 conn.logout().await;
                 return Err(Error::Recycle);
             }
+            let mut healthy_folder = None;
+            let mut selected = false;
             for name in &names {
-                let mailbox = conn.examine(name).await?;
+                let mailbox = match conn.examine(name).await {
+                    Ok(mailbox) => mailbox,
+                    Err(e) if e.reason == "mailbox_missing" => {
+                        let account = a.id.clone();
+                        let name = name.clone();
+                        self.store.write(move |c| Box::pin(async move {
+                            sqlx::query("INSERT INTO folders(id,account_id,name,uidvalidity,state,last_error) VALUES(?,?,?,0,'error','mailbox_missing') ON CONFLICT(account_id,name) DO UPDATE SET state='error',last_error='mailbox_missing'")
+                                .bind(id()).bind(account).bind(name).execute(c).await?;
+                            Ok(())
+                        })).await?;
+                        selected = false;
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                healthy_folder = Some(name);
+                selected = true;
                 let validity = i64::from(mailbox.uid_validity.ok_or(epistle_imap::Error {
                     reason: "uidvalidity_missing",
                     permanent: true,
@@ -29,16 +47,19 @@ impl Service {
                 .bind(name)
                 .fetch_optional(&self.store.reads)
                 .await?;
-                let (fid, cursor) = if let Some(row) = existing {
+                let (fid, cursor, initial) = if let Some(row) = existing {
                     let fid: String = row.try_get("id")?;
-                    let cursor = if row.try_get::<i64, _>("uidvalidity")? == validity {
+                    let initial = row.try_get::<i64, _>("uidvalidity")? == 0;
+                    let cursor = if initial {
+                        next.saturating_sub(1)
+                    } else if row.try_get::<i64, _>("uidvalidity")? == validity {
                         row.try_get::<i64, _>("cursor_uid")?
                     } else {
                         0
                     };
-                    (fid, cursor)
+                    (fid, cursor, initial)
                 } else {
-                    (id(), next.saturating_sub(1))
+                    (id(), next.saturating_sub(1), false)
                 };
                 let f = fid.clone();
                 let account = a.id.clone();
@@ -51,8 +72,8 @@ INSERT OR IGNORE INTO
 folders(id,account_id,name,uidvalidity,uidnext,cursor_uid,highestmodseq)
 VALUES(?,?,?,?,?,?,?)
 ").bind(&f).bind(&account).bind(&n).bind(validity).bind(next).bind(cursor).bind(modseq).execute(&mut *c).await?.rows_affected();
-     sqlx::query("UPDATE folders SET uidvalidity=?,uidnext=?,cursor_uid=?,highestmodseq=? WHERE id=?").bind(validity).bind(next).bind(cursor).bind(modseq).bind(&f).execute(&mut *c).await?;
-     if inserted>0 {sqlx::query("INSERT INTO backfill_jobs(id,account_id,since,until,folders_json,created_at) VALUES(?,?,?,?,?,?)").bind(id()).bind(account).bind(now()-i64::from(days)*86400).bind(now()+1).bind(serde_json::to_string(&vec![n])?).bind(now()).execute(&mut *c).await?;
+     sqlx::query("UPDATE folders SET uidvalidity=?,uidnext=?,cursor_uid=?,highestmodseq=?,state='idle',last_error=NULL,last_synced_at=? WHERE id=?").bind(validity).bind(next).bind(cursor).bind(modseq).bind(now()).bind(&f).execute(&mut *c).await?;
+     if inserted>0 || initial {sqlx::query("INSERT INTO backfill_jobs(id,account_id,since,until,folders_json,created_at) VALUES(?,?,?,?,?,?)").bind(id()).bind(account).bind(now()-i64::from(days)*86400).bind(now()+1).bind(serde_json::to_string(&vec![n])?).bind(now()).execute(&mut *c).await?;
 }Ok(())
     })).await?;
                 let ids = conn
@@ -76,32 +97,47 @@ VALUES(?,?,?,?,?,?,?)
 Ok(())})).await?;
                 }
             }
-            self.store
-                .status_for_revision(&a.id, a.revision, "active", None, 0)
-                .await?;
-            let account = a.id.clone();
-            self.store
-                .write(move |c| {
-                    Box::pin(async move {
-                        sqlx::query("UPDATE accounts SET last_success_at=? WHERE id=?")
-                            .bind(now())
-                            .bind(account)
-                            .execute(c)
-                            .await?;
-                        Ok(())
+            if let Some(name) = healthy_folder {
+                // A failed EXAMINE may deselect the previous mailbox.
+                if !selected {
+                    conn.examine(name).await?;
+                }
+                self.store
+                    .status_for_revision(&a.id, a.revision, "active", None, 0)
+                    .await?;
+                let account = a.id.clone();
+                self.store
+                    .write(move |c| {
+                        Box::pin(async move {
+                            sqlx::query("UPDATE accounts SET last_success_at=? WHERE id=?")
+                                .bind(now())
+                                .bind(account)
+                                .execute(c)
+                                .await?;
+                            Ok(())
+                        })
                     })
-                })
-                .await?;
-            self.store.worker_state(&a.id, "idle").await?;
+                    .await?;
+                self.store.worker_state(&a.id, "idle").await?;
+            } else {
+                self.store
+                    .status_for_revision(&a.id, a.revision, "degraded", Some("mailbox_missing"), 0)
+                    .await?;
+            }
             let seconds = self
                 .config
                 .reconcile_secs
                 .min((recycle_at - now()).max(1) as u64);
-            conn = conn.idle(seconds).await?;
+            if healthy_folder.is_some() {
+                conn = conn.idle(seconds).await?;
+            } else {
+                tokio::time::sleep(Duration::from_secs(seconds)).await;
+            }
         }
     }
     async fn active(&self, a: &Account) -> Result<bool, Error> {
-        Ok(self.store.account(&a.id).await?.status == "active")
+        let current = self.store.account(&a.id).await?;
+        Ok(current.enabled && current.revision == a.revision && current.status == "active")
     }
     pub(crate) async fn fetch_worker(&self, a: &Account) -> Result<(), Error> {
         let mut connection: Option<(Connection, i64)> = None;
@@ -141,7 +177,7 @@ ORDER BY created_at,id LIMIT ?
                 }
                 connection = Some(self.connect(a).await?);
             }
-            let Some((conn, _)) = connection.as_mut() else {
+            let Some((conn, recycle_at)) = connection.as_mut() else {
                 continue;
             };
             if jobs > 0 {
@@ -149,6 +185,9 @@ ORDER BY created_at,id LIMIT ?
             }
             let mut bytes = 0;
             for row in rows {
+                if now() >= *recycle_at || !self.active(a).await? {
+                    break;
+                }
                 let original_pointer: String = row.try_get("pointer")?;
                 let p: Pointer = serde_json::from_str(&original_pointer)?;
                 if bytes > 0 && bytes + p.size > self.config.fetch_batch_bytes {
@@ -160,12 +199,15 @@ ORDER BY created_at,id LIMIT ?
                 let fetched = match fetch {
                     Ok(f) => f,
                     Err(e) => {
-                        let attempts = row.try_get::<i64, _>("attempts")? + 1;
+                        // Socket/auth/provider failures belong to the account,
+                        // not this message. An outage must not exhaust its queue.
+                        if e.reason != "invalid_message_id" {
+                            return Err(e.into());
+                        }
                         let reason = e.reason;
-                        let max = self.config.max_attempts;
-                        self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE fetch_queue SET attempts=?,state=?,last_error=?,next_attempt_at=? WHERE id=? AND pointer=?").bind(attempts).bind(if attempts>=max{"dead"}else{"pending"}).bind(reason).bind(now()+backoff(attempts)).bind(stub).bind(original_pointer).execute(c).await?;
+                        self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE fetch_queue SET attempts=attempts+1,state='dead',last_error=? WHERE id=? AND pointer=?").bind(reason).bind(stub).bind(original_pointer).execute(c).await?;
 Ok(())})).await?;
-                        return Err(e.into());
+                        continue;
                     }
                 };
                 if let Some((resolved, raw)) = fetched {
@@ -230,7 +272,18 @@ BY created_at LIMIT 1
             conn.folders(a).await?
         };
         for name in names {
-            let mailbox = conn.examine(&name).await?;
+            let mailbox = match conn.examine(&name).await {
+                Ok(mailbox) => mailbox,
+                Err(e) if e.reason == "mailbox_missing" => {
+                    self.store.write(move |c| Box::pin(async move {
+                        sqlx::query("UPDATE backfill_jobs SET state='failed',last_error='mailbox_missing',completed_at=? WHERE id=? AND state IN ('pending','scanning')")
+                            .bind(now()).bind(job).execute(c).await?;
+                        Ok(())
+                    })).await?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
             let validity = i64::from(mailbox.uid_validity.ok_or(epistle_imap::Error {
                 reason: "uidvalidity_missing",
                 permanent: true,
@@ -378,8 +431,11 @@ prior.state='pending' AND prior.rowid<cmd.rowid) ORDER BY rowid LIMIT 50
             if rows.is_empty() {
                 continue;
             }
-            let (mut conn, _) = self.connect(a).await?;
+            let (mut conn, recycle_at) = self.connect(a).await?;
             for row in rows {
+                if now() >= recycle_at || !self.active(a).await? {
+                    break;
+                }
                 let command: String = row.try_get("id")?;
                 let mid: String = row.try_get("message_key")?;
                 let pointer: Option<String> =
@@ -387,6 +443,7 @@ prior.state='pending' AND prior.rowid<cmd.rowid) ORDER BY rowid LIMIT 50
                         .bind(&mid)
                         .fetch_optional(&self.store.reads)
                         .await?;
+                let original_pointer = pointer.clone();
                 let outcome = if let Some(pointer) = pointer {
                     let p: Pointer = serde_json::from_str(&pointer)?;
                     conn.mark_read(&p, row.try_get("read_value")?).await
@@ -396,17 +453,21 @@ prior.state='pending' AND prior.rowid<cmd.rowid) ORDER BY rowid LIMIT 50
                 match outcome {
                     Ok(p) => {
                         let state = if p.is_some() { "done" } else { "gone" };
-                        self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE commands SET state=?,completed_at=? WHERE id=?").bind(state).bind(now()).bind(command).execute(&mut *c).await?;
+                        self.store.write(move|c|Box::pin(async move{
+      let current:Option<String>=sqlx::query_scalar("SELECT pointer FROM message_index WHERE message_key=?").bind(&mid).fetch_optional(&mut *c).await?;
+      if current != original_pointer { return Ok(()); }
+      sqlx::query("UPDATE commands SET state=?,completed_at=? WHERE id=?").bind(state).bind(now()).bind(command).execute(&mut *c).await?;
       if let Some(p)=p{sqlx::query("UPDATE message_index SET uidvalidity=?,uid=?,pointer=? WHERE message_key=?").bind(p.uidvalidity).bind(p.uid).bind(serde_json::to_string(&p)?).bind(mid).execute(c).await?;
 }Ok(())})).await?;
                     }
                     Err(e) => {
-                        let attempts = row.try_get::<i64, _>("attempts")? + 1;
+                        if e.reason != "invalid_message_id" {
+                            return Err(e.into());
+                        }
                         let reason = e.reason;
-                        let dead = e.permanent || attempts >= self.config.max_attempts;
-                        self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE commands SET state=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?").bind(if dead{"failed"}else{"pending"}).bind(attempts).bind(now()+backoff(attempts)).bind(reason).bind(command).execute(c).await?;
+                        self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE commands SET state='failed',attempts=attempts+1,completed_at=?,last_error=? WHERE id=?").bind(now()).bind(reason).bind(command).execute(c).await?;
 Ok(())})).await?;
-                        return Err(e.into());
+                        continue;
                     }
                 }
             }

@@ -243,3 +243,86 @@ async fn epoch_fallback_checks_exact_message_id_before_store() {
     drop(conn);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn rejected_commands_never_expose_partial_results_or_success() {
+    for rejected in ["CAPABILITY", "LIST", "UID SEARCH", "UID FETCH", "UID STORE"] {
+        for status in ["NO", "BAD"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = account(listener.local_addr().unwrap().port());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.write_all(b"* OK ready\r\n").await.unwrap();
+                let mut io = BufReader::new(socket);
+                loop {
+                    let mut line = String::new();
+                    if io.read_line(&mut line).await.unwrap() == 0 {
+                        break;
+                    }
+                    let tag = line.split_whitespace().next().unwrap();
+                    let command = line.split_once(' ').unwrap().1;
+                    let partial = if command.starts_with("CAPABILITY") {
+                        "* CAPABILITY IMAP4rev1\r\n"
+                    } else if command.starts_with("LIST") {
+                        "* LIST () \"/\" \"Sent\"\r\n"
+                    } else if command.starts_with("UID SEARCH") {
+                        "* SEARCH 1\r\n"
+                    } else if command.starts_with("UID FETCH") {
+                        "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n"
+                    } else if command.starts_with("SELECT") {
+                        "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] epoch\r\n"
+                    } else {
+                        ""
+                    };
+                    let completion = if command.starts_with(rejected) {
+                        status
+                    } else {
+                        "OK"
+                    };
+                    io.get_mut()
+                        .write_all(
+                            format!("{partial}{tag} {completion} [UNAVAILABLE] test failure\r\n")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+            let connection = Connection::connect(&a, "secret".into(), true, 2).await;
+            if rejected == "CAPABILITY" {
+                assert_eq!(connection.err().unwrap().reason, "provider_outage");
+            } else {
+                let mut conn = connection.unwrap();
+                let error = match rejected {
+                    "LIST" => conn.folders(&a).await.err(),
+                    "UID SEARCH" => conn.search("ALL").await.err(),
+                    "UID FETCH" => conn.metadata(&a, "f", "INBOX", 1, "1").await.err(),
+                    "UID STORE" => {
+                        let pointer = epistle_core::Pointer {
+                            account_id: a.id.clone(),
+                            folder_id: "f".into(),
+                            folder: "INBOX".into(),
+                            uidvalidity: 1,
+                            uid: 1,
+                            rfc_message_id: None,
+                            gmail_id: None,
+                            thread_id: None,
+                            labels: vec![],
+                            flags: vec![],
+                            size: 1,
+                            internal_date: 0,
+                        };
+                        conn.mark_read(&pointer, true).await.err()
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    error.unwrap().reason,
+                    "provider_outage",
+                    "{rejected} {status}"
+                );
+            }
+            server.await.unwrap();
+        }
+    }
+}
