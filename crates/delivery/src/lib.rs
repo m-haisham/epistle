@@ -289,3 +289,45 @@ impl Delivery {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    #[test]
+    fn signatures_bind_exact_bytes_and_timestamp() {
+        let signature = signature("secret", 1000, b"{\"a\":1}").unwrap();
+        assert!(verify_signature(
+            "secret",
+            1000,
+            b"{\"a\":1}",
+            &signature,
+            1001,
+            300
+        ));
+        assert!(!verify_signature(
+            "secret",
+            1000,
+            b"{\"a\":2}",
+            &signature,
+            1001,
+            300
+        ));
+        assert!(!verify_signature(
+            "secret",
+            1000,
+            b"{\"a\":1}",
+            &signature,
+            1400,
+            300
+        ));
+        assert!(!verify_signature(
+            "wrong",
+            1000,
+            b"{\"a\":1}",
+            &signature,
+            1001,
+            300
+        ));
+    }
+}

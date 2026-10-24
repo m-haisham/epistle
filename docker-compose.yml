@@ -1,0 +1,35 @@
+services:
+  dovecot:
+    build: ./infra/dovecot
+    ports:
+      - "127.0.0.1:1143:143"
+    depends_on: [mock]
+  mock:
+    image: python:3.13-slim
+    command: python /mock.py
+    volumes:
+      - ./infra/mock.py:/mock.py:ro
+    ports:
+      - "127.0.0.1:8090:8090"
+  epistle:
+    build: .
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      API_KEY: local-test-api-key-0000000000000000
+      MASTER_KEY: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+      WEBHOOK_URL: http://mock:8090/webhook
+      WEBHOOK_SECRET: local-test-webhook-secret-00000000
+      ALLOW_INSECURE_TEST_ENDPOINTS: "true"
+      PUBLIC_URL: http://localhost:8080
+      TOKEN_ENDPOINT_OVERRIDE: http://mock:8090/token
+      GOOGLE_CLIENT_ID: local-test
+      GOOGLE_CLIENT_SECRET: local-test
+      RECONCILE_SECS: 2
+      DISK_RESERVE_BYTES: 0
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - epistle-data:/home/epistle/data
+    depends_on: [dovecot, mock]
+volumes:
+  epistle-data:

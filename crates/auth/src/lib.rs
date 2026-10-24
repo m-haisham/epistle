@@ -488,3 +488,38 @@ impl TokenProvider {
         Ok(a.id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::*;
+    #[test]
+    fn envelope_encryption_binds_account_and_detects_tampering() {
+        let vault = Vault::new(&"01".repeat(32)).unwrap();
+        let sealed = vault.seal("account-a", b"refresh-token-secret").unwrap();
+        assert!(!sealed.contains("refresh-token-secret"));
+        assert_eq!(
+            &**vault.open("account-a", &sealed).unwrap(),
+            b"refresh-token-secret"
+        );
+        assert!(vault.open("account-b", &sealed).is_err());
+        assert!(
+            Vault::new(&"02".repeat(32))
+                .unwrap()
+                .open("account-a", &sealed)
+                .is_err()
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+        value["ciphertext"] = serde_json::json!([0, 1, 2]);
+        assert!(vault.open("account-a", &value.to_string()).is_err());
+        assert_ne!(
+            sealed,
+            vault.seal("account-a", b"refresh-token-secret").unwrap()
+        );
+    }
+}

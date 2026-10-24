@@ -1,0 +1,6 @@
+.git
+.hshm
+target
+data
+.env
+epistle.toml

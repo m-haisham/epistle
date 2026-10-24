@@ -202,3 +202,80 @@ pub async fn status_tx(
  .bind(id()).bind(a).bind(seq).bind(prev).bind(status).bind(reason).bind(reason).bind(t).execute(c).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    async fn fixture() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.sqlite")).await.unwrap();
+        store.write(|c| Box::pin(async move {
+            sqlx::query("INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at) VALUES('a','ref','\"password\"','a@example.test','{}',0,0)").execute(c).await?; Ok(())
+        })).await.unwrap();
+        (dir, store)
+    }
+    #[tokio::test]
+    async fn migrations_wal_atomic_rollback_and_epoch_fencing() {
+        let (dir, store) = fixture().await;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&store.reads)
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let outcome: Result<(), Error> = store
+            .write(|c| {
+                Box::pin(async move {
+                    sqlx::query("UPDATE accounts SET external_ref='changed' WHERE id='a'")
+                        .execute(c)
+                        .await?;
+                    Err(Error::Conflict("injected crash before commit"))
+                })
+            })
+            .await;
+        assert!(outcome.is_err());
+        let value: String = sqlx::query_scalar("SELECT external_ref FROM accounts")
+            .fetch_one(&store.reads)
+            .await
+            .unwrap();
+        assert_eq!(value, "ref");
+        let newer = Store::open(&dir.path().join("test.sqlite")).await.unwrap();
+        assert_eq!(newer.epoch, store.epoch + 1);
+        assert!(matches!(
+            store.status("a", "active", None, 0).await,
+            Err(Error::Fenced)
+        ));
+        newer.status("a", "active", None, 0).await.unwrap();
+    }
+    #[tokio::test]
+    async fn transitions_are_atomic_edge_triggered_and_ordered() {
+        let (_dir, store) = fixture().await;
+        for (status, reason, failures) in [
+            ("connecting", None, 0),
+            ("active", None, 0),
+            ("active", None, 0),
+            ("reconnecting", Some("token_recycle"), 0),
+            ("degraded", Some("server_unreachable"), 1),
+            ("degraded", Some("server_unreachable"), 2),
+            ("needs_reauth", Some("token_revoked"), 2),
+        ] {
+            store.status("a", status, reason, failures).await.unwrap();
+        }
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM connection_events")
+            .fetch_one(&store.reads)
+            .await
+            .unwrap();
+        let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox")
+            .fetch_one(&store.reads)
+            .await
+            .unwrap();
+        assert_eq!((events, outbox), (6, 6));
+        let seq: i64 = sqlx::query_scalar("SELECT status_seq FROM accounts")
+            .fetch_one(&store.reads)
+            .await
+            .unwrap();
+        assert_eq!(seq, 6);
+        let ready: i64=sqlx::query_scalar("SELECT COUNT(*) FROM outbox o WHERE NOT EXISTS(SELECT 1 FROM outbox e WHERE e.message_key=o.message_key AND e.seq<o.seq AND e.state='pending')").fetch_one(&store.reads).await.unwrap();
+        assert_eq!(ready, 1);
+    }
+}
