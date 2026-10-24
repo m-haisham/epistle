@@ -18,7 +18,9 @@ epistle-delivery = { path = "crates/delivery", version = "0.1.0" }
 epistle-api = { path = "crates/api", version = "0.1.0" }
 aide = { version = "0.15.1", features = ["axum", "axum-json", "axum-query"] }
 axum = { version = "0.8.9", features = ["macros"] }
-async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+async-imap = { version = "0.12.0", default-features = false, features = [
+    "runtime-tokio",
+] }
 base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 config = { version = "0.15.27", default-features = false, features = ["toml"] }
@@ -31,13 +33,22 @@ hmac = "0.13.0"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 mail-parser = "1.0.0"
 rand = "0.10.3"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "form", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "form",
+    "rustls",
+] }
 schemars = { version = "0.9.0", features = ["chrono04"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.11.1"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "migrate",
+    "macros",
+] }
 subtle = "2.6.1"
 thiserror = "2.0.17"
 tokio = { version = "1.54.1", features = ["full"] }
@@ -58,6 +69,13 @@ expect_used = "deny"
 panic = "deny"
 todo = "deny"
 indexing_slicing = "deny"
+
+[profile.release]
+strip = "debuginfo"
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
