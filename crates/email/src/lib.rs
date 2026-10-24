@@ -104,7 +104,8 @@ impl Service {
                 if !a.enabled
                     || panicked.contains(&a.id)
                     || accounts.contains_key(&a.id)
-                    || matches!(a.status.as_str(), "needs_reauth" | "error")
+                    || a.status == "error"
+                    || (a.status == "needs_reauth" && self.config.reauth_reminder_secs <= 0)
                 {
                     continue;
                 }
@@ -113,7 +114,11 @@ impl Service {
                 let child = stop.clone();
                 let account = a.clone();
                 let task = tokio::spawn(async move {
-                    service.supervise(account, child).await;
+                    if account.status == "needs_reauth" {
+                        service.remind(&account, &child).await;
+                    } else {
+                        service.supervise(account, child).await;
+                    }
                 });
                 accounts.insert(a.id, (a.revision, stop, task));
             }
@@ -124,12 +129,21 @@ impl Service {
         }
     }
     async fn supervise(self, a: Account, cancel: CancellationToken) {
+        let mut failures = a.consecutive_failures;
+        let mut first_failure = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT first_failure_at FROM accounts WHERE id=?",
+        )
+        .bind(&a.id)
+        .fetch_optional(&self.store.reads)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .unwrap_or(0);
         let _ = self
             .store
-            .status_for_revision(&a.id, a.revision, "connecting", None, 0)
+            .status_for_revision(&a.id, a.revision, "connecting", None, failures)
             .await;
-        let mut failures = 0;
-        let mut first_failure = 0;
         loop {
             let run = async {
                 tokio::try_join!(
@@ -205,11 +219,7 @@ impl Service {
             tracing::warn!(account_id=%a.id,reason,failures,"account connection interrupted");
             if permanent {
                 if status == "needs_reauth" && self.config.reauth_reminder_secs > 0 {
-                    loop {
-                        tokio::select! {_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(self.config.reauth_reminder_secs as u64))=>{failures+=1;
-                        let _=self.store.status_for_revision(&a.id, a.revision,status,Some(reason),failures).await;
-                        }}
-                    }
+                    self.remind(&a, &cancel).await;
                 }
                 return;
             }
@@ -219,6 +229,33 @@ impl Service {
                 backoff(failures)
             };
             tokio::select! {_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(delay as u64))=>{}}
+        }
+    }
+    async fn remind(&self, a: &Account, cancel: &CancellationToken) {
+        while self.config.reauth_reminder_secs > 0 {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(self.config.reauth_reminder_secs as u64)) => {}
+            }
+            let Ok(current) = self.store.account(&a.id).await else {
+                return;
+            };
+            if !current.enabled
+                || current.revision != a.revision
+                || current.status != "needs_reauth"
+            {
+                return;
+            }
+            let _ = self
+                .store
+                .status_for_revision(
+                    &a.id,
+                    a.revision,
+                    "needs_reauth",
+                    current.status_reason.as_deref(),
+                    current.consecutive_failures + 1,
+                )
+                .await;
         }
     }
 }

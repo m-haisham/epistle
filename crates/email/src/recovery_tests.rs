@@ -163,3 +163,111 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
     command.abort();
     server.abort();
 }
+
+#[tokio::test]
+async fn restart_resumes_opt_in_reauth_reminders_without_reconnecting() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
+    support::account(&store, AuthKind::MicrosoftOauth).await;
+    store
+        .status("a", "needs_reauth", Some("token_revoked"), 3)
+        .await
+        .unwrap();
+    drop(store);
+    let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
+    let mut config = support::config(dir.path());
+    config.reauth_reminder_secs = 1;
+    let config = Arc::new(config);
+    let service = Service {
+        tokens: TokenProvider::new(store.clone(), config.clone()).unwrap(),
+        store: store.clone(),
+        files: FileStore::new(dir.path()),
+        config,
+    };
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(service.run(stop.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let account = store.account("a").await.unwrap();
+            assert_eq!(account.status, "needs_reauth");
+            assert_eq!(account.status_reason.as_deref(), Some("token_revoked"));
+            if account.status_seq == 2 {
+                assert_eq!(account.consecutive_failures, 4);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_keeps_password_failure_count_and_elapsed_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
+    support::account(&store, AuthKind::Password).await;
+    store
+        .status("a", "degraded", Some("credentials_rejected"), 3)
+        .await
+        .unwrap();
+    store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query("UPDATE accounts SET first_failure_at=? WHERE id='a'")
+                    .bind(now() - 180)
+                    .execute(c)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut a = store.account("a").await.unwrap();
+    a.config.host = "127.0.0.1".into();
+    a.config.port = listener.local_addr().unwrap().port();
+    a.config.tls = false;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"* OK ready\r\n").await.unwrap();
+        let mut io = BufReader::new(socket);
+        let mut line = String::new();
+        io.read_line(&mut line).await.unwrap();
+        let tag = line.split_whitespace().next().unwrap();
+        io.get_mut()
+            .write_all(format!("{tag} NO [AUTHENTICATIONFAILED] rejected\r\n").as_bytes())
+            .await
+            .unwrap();
+    });
+    let config = Arc::new(support::config(dir.path()));
+    let tokens = TokenProvider::new(store.clone(), config.clone()).unwrap();
+    tokens
+        .save(
+            "a",
+            &Credentials {
+                password: Some("invalid".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let service = Service {
+        tokens,
+        store: store.clone(),
+        files: FileStore::new(dir.path()),
+        config,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        service.supervise(a, CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+    let a = store.account("a").await.unwrap();
+    assert_eq!(a.status, "needs_reauth");
+    assert_eq!(a.consecutive_failures, 4);
+    server.await.unwrap();
+}
