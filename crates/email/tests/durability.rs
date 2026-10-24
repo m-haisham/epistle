@@ -285,3 +285,70 @@ crash'); END
     assert_eq!(count(&store, "message_files").await, 1);
     task.abort();
 }
+
+#[tokio::test]
+async fn rediscovery_redirects_in_flight_fetch_and_revives_gone_stub() {
+    let (_dir, store, _files) = fixture().await;
+    discover(&store, false).await;
+    let original = serde_json::to_string(&pointer()).unwrap();
+    let moved = Pointer {
+        uid: 2,
+        ..pointer()
+    };
+    let replacement = serde_json::to_string(&moved).unwrap();
+    store
+        .write(move |c| {
+            Box::pin(async move {
+                assert!(!enqueue(c, &moved, "live", None, false).await?);
+                // Simulate the stale fetch completing after watcher rediscovery.
+                sqlx::query("UPDATE fetch_queue SET state='gone' WHERE pointer=?")
+                    .bind(original)
+                    .execute(c)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM fetch_queue")
+        .fetch_one(&store.reads)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+    let stored: String = sqlx::query_scalar("SELECT pointer FROM fetch_queue")
+        .fetch_one(&store.reads)
+        .await
+        .unwrap();
+    assert_eq!(stored, replacement);
+    store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query("UPDATE fetch_queue SET state='gone'")
+                    .execute(&mut *c)
+                    .await?;
+                assert!(
+                    enqueue(
+                        c,
+                        &Pointer {
+                            uid: 3,
+                            ..pointer()
+                        },
+                        "live",
+                        None,
+                        false
+                    )
+                    .await?
+                );
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(count(&store, "fetch_queue").await, 1);
+    assert_eq!(count(&store, "seen").await, 1);
+    let state: String = sqlx::query_scalar("SELECT state FROM fetch_queue")
+        .fetch_one(&store.reads)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+}

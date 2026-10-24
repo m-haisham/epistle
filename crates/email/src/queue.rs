@@ -27,7 +27,48 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
 ")
  .bind(&key).bind(&p.account_id).bind(&p.folder_id).bind(p.uidvalidity).bind(p.uid).bind(&p.rfc_message_id).bind(&pointer).bind(now()).execute(&mut *c).await?;
     if existing.is_some() && !redeliver {
-        return Ok(false);
+        // A seen identity is not necessarily delivered: it may have moved while
+        // its original location was being fetched. Preserve the public ID and
+        // redirect/revive its queued work instead of losing the message.
+        let handed_off: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id=?")
+            .bind(&key)
+            .fetch_one(&mut *c)
+            .await?;
+        if handed_off > 0 {
+            return Ok(false);
+        }
+        if let Some(row) = sqlx::query(
+            "SELECT id,state FROM fetch_queue WHERE message_key=? ORDER BY rowid LIMIT 1",
+        )
+        .bind(&key)
+        .fetch_optional(&mut *c)
+        .await?
+        {
+            let stub: String = row.try_get("id")?;
+            let state: String = row.try_get("state")?;
+            if state == "pending" {
+                sqlx::query(
+                    "UPDATE fetch_queue SET pointer=?,next_attempt_at=0 WHERE id=? AND pointer!=?",
+                )
+                .bind(&pointer)
+                .bind(stub)
+                .bind(&pointer)
+                .execute(c)
+                .await?;
+                return Ok(false);
+            }
+            sqlx::query(
+                "UPDATE fetch_queue SET pointer=?,origin=?,backfill_id=?,state='pending',
+                 attempts=0,next_attempt_at=0,last_error=NULL WHERE id=?",
+            )
+            .bind(&pointer)
+            .bind(origin)
+            .bind(job)
+            .bind(stub)
+            .execute(c)
+            .await?;
+            return Ok(true);
+        }
     }
     let idem = if redeliver {
         format!("{}:{}", p.key(), job.unwrap_or("live"))

@@ -149,7 +149,8 @@ ORDER BY created_at,id LIMIT ?
             }
             let mut bytes = 0;
             for row in rows {
-                let p: Pointer = serde_json::from_str(&row.try_get::<String, _>("pointer")?)?;
+                let original_pointer: String = row.try_get("pointer")?;
+                let p: Pointer = serde_json::from_str(&original_pointer)?;
                 if bytes > 0 && bytes + p.size > self.config.fetch_batch_bytes {
                     break;
                 }
@@ -162,7 +163,7 @@ ORDER BY created_at,id LIMIT ?
                         let attempts = row.try_get::<i64, _>("attempts")? + 1;
                         let reason = e.reason;
                         let max = self.config.max_attempts;
-                        self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE fetch_queue SET attempts=?,state=?,last_error=?,next_attempt_at=? WHERE id=?").bind(attempts).bind(if attempts>=max{"dead"}else{"pending"}).bind(reason).bind(now()+backoff(attempts)).bind(stub).execute(c).await?;
+                        self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE fetch_queue SET attempts=?,state=?,last_error=?,next_attempt_at=? WHERE id=? AND pointer=?").bind(attempts).bind(if attempts>=max{"dead"}else{"pending"}).bind(reason).bind(now()+backoff(attempts)).bind(stub).bind(original_pointer).execute(c).await?;
 Ok(())})).await?;
                         return Err(e.into());
                     }
@@ -186,10 +187,13 @@ Ok(())})).await?;
                     self.store
                         .write(move |c| {
                             Box::pin(async move {
-                                sqlx::query("UPDATE fetch_queue SET state='gone' WHERE id=?")
-                                    .bind(stub)
-                                    .execute(c)
-                                    .await?;
+                                sqlx::query(
+                                    "UPDATE fetch_queue SET state='gone' WHERE id=? AND pointer=?",
+                                )
+                                .bind(stub)
+                                .bind(original_pointer)
+                                .execute(c)
+                                .await?;
                                 Ok(())
                             })
                         })

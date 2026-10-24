@@ -374,4 +374,49 @@ e.message_key=o.message_key AND e.seq<o.seq AND e.state='pending')
         .unwrap();
         assert_eq!(ready, 1);
     }
+    #[tokio::test]
+    async fn old_account_revision_cannot_override_disable_or_reauthentication() {
+        let (_dir, store) = fixture().await;
+        store
+            .status_for_revision("a", 1, "active", None, 0)
+            .await
+            .unwrap();
+        store
+            .write(|c| {
+                Box::pin(async move {
+                    sqlx::query("UPDATE accounts SET revision=2,enabled=0 WHERE id='a'")
+                        .execute(&mut *c)
+                        .await?;
+                    status_tx(c, "a", "disabled", None, 0).await
+                })
+            })
+            .await
+            .unwrap();
+        store
+            .status_for_revision("a", 1, "active", None, 0)
+            .await
+            .unwrap();
+        assert_eq!(store.account("a").await.unwrap().status, "disabled");
+        store
+            .write(|c| {
+                Box::pin(async move {
+                    sqlx::query("UPDATE accounts SET enabled=1 WHERE id='a'")
+                        .execute(&mut *c)
+                        .await?;
+                    status_tx(c, "a", "connecting", None, 0).await
+                })
+            })
+            .await
+            .unwrap();
+        store
+            .status_for_revision("a", 1, "needs_reauth", Some("credentials_rejected"), 3)
+            .await
+            .unwrap();
+        assert_eq!(store.account("a").await.unwrap().status, "connecting");
+        store
+            .status_for_revision("a", 2, "active", None, 0)
+            .await
+            .unwrap();
+        assert_eq!(store.account("a").await.unwrap().status, "active");
+    }
 }
