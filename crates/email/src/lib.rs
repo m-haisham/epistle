@@ -11,7 +11,6 @@ pub use queue::{enqueue, handoff};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("database operation failed")]
@@ -83,12 +82,12 @@ impl Service {
                 }
             }
             for id in remove {
-                if let Some((_, stop, task)) = accounts.remove(&id) {
+                if let Some((revision, stop, task)) = accounts.remove(&id) {
                     stop.cancel();
                     if task.await.is_err() {
                         let _ = self
                             .store
-                            .status(&id, "error", Some("worker_panicked"), 0)
+                            .status_for_revision(&id, revision, "error", Some("worker_panicked"), 0)
                             .await;
                     }
                 }
@@ -116,7 +115,10 @@ impl Service {
         }
     }
     async fn supervise(self, a: Account, cancel: CancellationToken) {
-        let _ = self.store.status(&a.id, "connecting", None, 0).await;
+        let _ = self
+            .store
+            .status_for_revision(&a.id, a.revision, "connecting", None, 0)
+            .await;
         let mut failures = 0;
         let mut first_failure = 0;
         loop {
@@ -134,7 +136,13 @@ impl Service {
                 failures = 0;
                 let _ = self
                     .store
-                    .status(&a.id, "reconnecting", Some("token_recycle"), 0)
+                    .status_for_revision(
+                        &a.id,
+                        a.revision,
+                        "reconnecting",
+                        Some("token_recycle"),
+                        0,
+                    )
                     .await;
                 continue;
             }
@@ -167,19 +175,27 @@ impl Service {
             if failures == 1 && !permanent {
                 let _ = self
                     .store
-                    .status(&a.id, "reconnecting", Some("connection_lost"), failures)
+                    .status_for_revision(
+                        &a.id,
+                        a.revision,
+                        "reconnecting",
+                        Some("connection_lost"),
+                        failures,
+                    )
                     .await;
             }
             let _ = self
                 .store
-                .status(&a.id, status, Some(reason), failures)
+                .status_for_revision(&a.id, a.revision, status, Some(reason), failures)
                 .await;
             let _ = self.store.worker_state(&a.id, "backoff").await;
             tracing::warn!(account_id=%a.id,reason,failures,"account connection interrupted");
             if permanent {
                 if status == "needs_reauth" && self.config.reauth_reminder_secs > 0 {
                     loop {
-                        tokio::select! {_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(self.config.reauth_reminder_secs as u64))=>{failures+=1;let _=self.store.status(&a.id,status,Some(reason),failures).await;}}
+                        tokio::select! {_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(self.config.reauth_reminder_secs as u64))=>{failures+=1;
+                        let _=self.store.status_for_revision(&a.id, a.revision,status,Some(reason),failures).await;
+                        }}
                     }
                 }
                 return;

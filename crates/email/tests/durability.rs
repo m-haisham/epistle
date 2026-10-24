@@ -9,7 +9,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicU16, Ordering},
 };
-
 fn pointer() -> Pointer {
     Pointer {
         account_id: "a".into(),
@@ -122,7 +121,22 @@ async fn crash_boundaries_preserve_stub_and_remove_orphan_files() {
     discover(&store, false).await;
     let (stub, prepared) = prepare(&store, &files).await;
     let orphan = prepared.payload_path.clone();
-    store.write(|c|Box::pin(async move{sqlx::query("CREATE TRIGGER fail_handoff BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'injected crash'); END").execute(c).await?;Ok(())})).await.unwrap();
+    store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "
+CREATE TRIGGER fail_handoff BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'injected
+crash'); END
+",
+                )
+                .execute(c)
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     assert!(handoff(&store, stub, prepared).await.is_err());
     assert_eq!(count(&store, "fetch_queue").await, 1);
     assert_eq!(count(&store, "messages").await, 0);
@@ -235,7 +249,22 @@ async fn dead_and_retrying_deliveries_retain_files_ack_starts_expiry() {
         .unwrap();
     status.store(200, Ordering::SeqCst);
     // Inject a failure after the HTTP acknowledgment: the row remains replayable.
-    store.write(|c|Box::pin(async move{sqlx::query("CREATE TRIGGER fail_ack BEFORE DELETE ON outbox BEGIN SELECT RAISE(ABORT,'injected ack crash'); END").execute(c).await?;Ok(())})).await.unwrap();
+    store
+        .write(|c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "
+CREATE TRIGGER fail_ack BEFORE DELETE ON outbox BEGIN SELECT RAISE(ABORT,'injected ack
+crash'); END
+",
+                )
+                .execute(c)
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     assert!(delivery.tick().await.is_err());
     assert_eq!(count(&store, "outbox").await, 1);
     store

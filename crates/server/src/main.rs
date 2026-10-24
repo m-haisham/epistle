@@ -5,7 +5,6 @@ use epistle_store::Store;
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-
 #[derive(Debug, Error)]
 enum Error {
     #[error("configuration failed: {0}")]
@@ -70,7 +69,18 @@ async fn run() -> Result<(), Error> {
     let sweep_stop = cancel.clone();
     let sweep_store = store.clone();
     let sweep_config = config.clone();
-    tasks.spawn(async move{loop{tokio::select!{_=sweep_stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(60))=>{if let Err(e)=files.sweep(&sweep_store,&sweep_config,false).await{tracing::error!(error=%e,"retention sweep failed");}}}}});
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sweep_stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    if let Err(e) = files.sweep(&sweep_store, &sweep_config, false).await {
+                        tracing::error!(error=%e,"retention sweep failed");
+                    }
+                }
+            }
+        }
+    });
     let epoch = store.epoch;
     let router = epistle_api::router(epistle_api::AppState {
         store,
@@ -84,13 +94,16 @@ async fn run() -> Result<(), Error> {
         axum::serve(listener, router).with_graceful_shutdown(http_stop.cancelled_owned()),
     );
     tokio::pin!(server);
-    let outcome = tokio::select! {
-     result=&mut server=>result.map_err(Error::Io),
-     _=shutdown()=>Ok(()),
-     _=tasks.join_next()=>Err(Error::Task),
+    let (outcome, http_finished) = tokio::select! {
+        result = &mut server => (result.map_err(Error::Io), true),
+        _ = shutdown() => (Ok(()), false),
+        _ = tasks.join_next() => (Err(Error::Task), false),
     };
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(35), async {
+        if !http_finished {
+            let _ = (&mut server).await;
+        }
         while tasks.join_next().await.is_some() {}
     })
     .await;

@@ -12,7 +12,6 @@ use tokio_rustls::{
     TlsConnector,
     rustls::{ClientConfig, RootCertStore, pki_types::ServerName},
 };
-
 #[derive(Debug, Error, Clone)]
 #[error("IMAP operation failed: {reason}")]
 pub struct Error {
@@ -171,6 +170,12 @@ impl Connection {
                 classified
             })?;
             let caps = session.capabilities().await.map_err(Error::from)?;
+            if caps.has_str("ENABLE") && caps.has_str("CONDSTORE") {
+                session
+                    .run_command_and_check_ok("ENABLE CONDSTORE")
+                    .await
+                    .map_err(Error::from)?;
+            }
             Ok(Self {
                 gmail: caps.has_str("X-GM-EXT-1"),
                 idle_supported: caps.has_str("IDLE"),
@@ -436,5 +441,34 @@ fn flag_string(f: async_imap::types::Flag<'_>) -> String {
         Flag::Custom(s) => s.into_owned(),
         Flag::MayCreate => "\\*".into(),
         other => format!("\\{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn xoauth_error_challenge_is_acknowledged_without_repeating_secret() {
+        use async_imap::Authenticator;
+        let mut auth = Xoauth {
+            email: "a@example.test".into(),
+            token: "secret-token".into(),
+            sent: false,
+        };
+        assert!(auth.process(b"").contains("auth=Bearer secret-token"));
+        assert_eq!(auth.process(br#"{"status":"401"}"#), "");
+    }
+    #[test]
+    fn provider_error_text_does_not_escape_and_search_is_quoted() {
+        let e = Error::from(async_imap::error::Error::No(
+            "[AUTHENTICATIONFAILED] secret-token".into(),
+        ));
+        assert!(e.auth);
+        assert!(!e.to_string().contains("secret-token"));
+        assert!(quote("bad\r\nUID STORE 1 +FLAGS (\\Seen)").is_err());
+        assert_eq!(
+            quote("<a\"b@example.test>").ok().as_deref(),
+            Some("\"<a\\\"b@example.test>\"")
+        );
     }
 }

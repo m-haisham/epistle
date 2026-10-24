@@ -10,8 +10,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-
-async fn fixture() -> (
+async fn fixture(
+    kind: AuthKind,
+) -> (
     tempfile::TempDir,
     TokenProvider,
     epistle_core::Account,
@@ -20,13 +21,42 @@ async fn fixture() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("test.sqlite")).await.unwrap();
-    let a = support::account(&store, AuthKind::MicrosoftOauth).await;
+    let a = support::account(&store, kind).await;
     let calls = Arc::new(AtomicUsize::new(0));
-    async fn token(State(calls): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+    async fn token(
+        State(calls): State<Arc<AtomicUsize>>,
+        axum::Form(form): axum::Form<std::collections::HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let scope = if let Some(assertion) = form.get("assertion") {
+            let key = jsonwebtoken::DecodingKey::from_rsa_pem(include_bytes!(
+                "../../../tests/fixtures/service-account-test.pub.pem"
+            ))
+            .unwrap();
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_aud = false;
+            let claims = jsonwebtoken::decode::<serde_json::Value>(assertion, &key, &validation)
+                .unwrap()
+                .claims;
+            assert_eq!(
+                claims.get("sub").and_then(|v| v.as_str()),
+                Some("a@example.test")
+            );
+            assert_eq!(
+                claims.get("iss").and_then(|v| v.as_str()),
+                Some("test-service@example.test")
+            );
+            assert_eq!(
+                claims.get("scope").and_then(|v| v.as_str()),
+                Some("https://mail.google.com/")
+            );
+            "https://mail.google.com/"
+        } else {
+            "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+        };
         let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         Json(
-            serde_json::json!({"access_token":format!("access-{n}"),"refresh_token":format!("refresh-{n}"),"expires_in":3600,"scope":"https://outlook.office.com/IMAP.AccessAsUser.All offline_access"}),
+            serde_json::json!({"access_token":format!("access-{n}"),"refresh_token":format!("refresh-{n}"),"expires_in":3600,"scope":scope}),
         )
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -54,7 +84,7 @@ async fn fixture() -> (
 }
 #[tokio::test]
 async fn concurrent_refresh_is_single_flight_and_rotation_is_durable() {
-    let (_dir, provider, a, calls, task) = fixture().await;
+    let (_dir, provider, a, calls, task) = fixture(AuthKind::MicrosoftOauth).await;
     let mut joins = tokio::task::JoinSet::new();
     for _ in 0..20 {
         let p = provider.clone();
@@ -89,7 +119,7 @@ async fn concurrent_refresh_is_single_flight_and_rotation_is_durable() {
 }
 #[tokio::test]
 async fn pkce_signed_state_is_single_use_and_revision_bound() {
-    let (_dir, provider, a, _calls, task) = fixture().await;
+    let (_dir, provider, a, _calls, task) = fixture(AuthKind::MicrosoftOauth).await;
     let url = url::Url::parse(&provider.authorization_url(&a).await.unwrap()).unwrap();
     let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
     assert_eq!(
@@ -131,5 +161,34 @@ async fn pkce_signed_state_is_single_use_and_revision_bound() {
         provider.callback(&state, "code").await,
         Err(Error::State)
     ));
+    task.abort();
+}
+
+#[tokio::test]
+async fn service_account_assertion_is_signed_and_delegates_mailbox() {
+    let (_dir, provider, a, calls, task) = fixture(AuthKind::GoogleServiceAccount).await;
+    provider
+        .save(
+            "a",
+            &Credentials {
+                client_email: Some("test-service@example.test".into()),
+                private_key: Some(
+                    include_str!("../../../tests/fixtures/service-account-test.pem").into(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        provider
+            .get_access_token(&a, false)
+            .await
+            .unwrap()
+            .secret
+            .expose_secret(),
+        "access-1"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     task.abort();
 }

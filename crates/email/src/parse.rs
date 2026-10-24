@@ -1,7 +1,6 @@
 use epistle_core::{Message, Pointer};
 use epistle_delivery::FileDraft;
 use serde_json::json;
-
 pub fn parse_message(
     id: String,
     p: &Pointer,
@@ -75,6 +74,9 @@ pub fn parse_message(
                         filename: name.into(),
                         content_type: mime.into(),
                         content_id: None,
+                        content_disposition: None,
+                        content_description: None,
+                        content_location: None,
                         bytes: body.as_bytes().to_vec(),
                     });
                 } else if role == "text" {
@@ -99,6 +101,9 @@ pub fn parse_message(
                 filename: part.attachment_name().unwrap_or("attachment").into(),
                 content_type,
                 content_id: part.content_id().map(str::to_owned),
+                content_disposition: part.content_disposition().map(|d| d.ctype().to_owned()),
+                content_description: part.content_description().map(str::to_owned),
+                content_location: part.content_location().map(str::to_owned),
                 bytes: part.decoded().into_owned(),
             });
         }
@@ -110,6 +115,9 @@ pub fn parse_message(
         filename: "message.eml".into(),
         content_type: "message/rfc822".into(),
         content_id: None,
+        content_disposition: None,
+        content_description: None,
+        content_location: None,
         bytes: raw,
     });
     (result, files)

@@ -7,7 +7,6 @@ use sqlx::{
 use std::{path::Path, time::Duration};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("database operation failed")]
@@ -128,6 +127,36 @@ impl Store {
         })
         .await
     }
+    /// Fence account workers too: a disabled account or replaced credential revision
+    /// must not be overwritten by a connection finishing an old round trip.
+    pub async fn status_for_revision(
+        &self,
+        account_id: &str,
+        revision: i64,
+        status: &str,
+        reason: Option<&str>,
+        failures: i64,
+    ) -> Result<(), Error> {
+        let (a, s, r) = (
+            account_id.to_owned(),
+            status.to_owned(),
+            reason.map(str::to_owned),
+        );
+        self.write(move |c| {
+            Box::pin(async move {
+                let current: Option<i64> =
+                    sqlx::query_scalar("SELECT revision FROM accounts WHERE id=? AND enabled=1")
+                        .bind(&a)
+                        .fetch_optional(&mut *c)
+                        .await?;
+                if current == Some(revision) {
+                    status_tx(c, &a, &s, r.as_deref(), failures).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
     pub async fn worker_state(&self, account_id: &str, state: &str) -> Result<(), Error> {
         let (a, s) = (account_id.to_owned(), state.to_owned());
         self.write(move |c| {
@@ -186,8 +215,26 @@ pub async fn status_tx(
     }
     let seq = seq + 1;
     let t = now();
-    sqlx::query("UPDATE accounts SET status=?,status_reason=?,status_seq=?,status_since=?,consecutive_failures=?,first_failure_at=CASE WHEN ?=0 THEN NULL ELSE COALESCE(first_failure_at,?) END,last_success_at=CASE WHEN ?='active' THEN ? ELSE last_success_at END WHERE id=?")
- .bind(status).bind(reason).bind(seq).bind(t).bind(failures).bind(failures).bind(t).bind(status).bind(t).bind(a).execute(&mut *c).await?;
+    sqlx::query(
+        "
+UPDATE accounts SET
+status=?,status_reason=?,status_seq=?,status_since=?,consecutive_failures=?,first_failure_at=CASE
+WHEN ?=0 THEN NULL ELSE COALESCE(first_failure_at,?) END,last_success_at=CASE WHEN
+?='active' THEN ? ELSE last_success_at END WHERE id=?
+",
+    )
+    .bind(status)
+    .bind(reason)
+    .bind(seq)
+    .bind(t)
+    .bind(failures)
+    .bind(failures)
+    .bind(t)
+    .bind(status)
+    .bind(t)
+    .bind(a)
+    .execute(&mut *c)
+    .await?;
     let retryable = matches!(status, "connecting" | "reconnecting" | "degraded");
     let action = match status {
         "needs_reauth" => Some("reauthenticate"),
@@ -196,10 +243,38 @@ pub async fn status_tx(
     };
     let payload = serde_json::json!({"id":id(),"kind":"account.status_changed","channel":"email","account_id":a,"status":status,"previous_status":prev,"status_seq":seq,"reason":reason,"detail":reason,"action_required":action,"retryable":retryable,"since":t,"consecutive_failures":failures});
     let body = serde_json::to_string(&payload)?;
-    sqlx::query("INSERT INTO outbox(idempotency_key,message_key,account_id,kind,payload,size_bytes,created_at) VALUES(?,?,?,'account.status_changed',?,?,?)")
- .bind(format!("status:{a}:{seq}")).bind(format!("account:{a}")).bind(a).bind(&body).bind(body.len() as i64).bind(t).execute(&mut *c).await?;
-    sqlx::query("INSERT INTO connection_events(id,account_id,seq,from_status,to_status,reason,detail,created_at) VALUES(?,?,?,?,?,?,?,?)")
- .bind(id()).bind(a).bind(seq).bind(prev).bind(status).bind(reason).bind(reason).bind(t).execute(c).await?;
+    sqlx::query(
+        "
+INSERT INTO
+outbox(idempotency_key,message_key,account_id,kind,payload,size_bytes,created_at)
+VALUES(?,?,?,'account.status_changed',?,?,?)
+",
+    )
+    .bind(format!("status:{a}:{seq}"))
+    .bind(format!("account:{a}"))
+    .bind(a)
+    .bind(&body)
+    .bind(body.len() as i64)
+    .bind(t)
+    .execute(&mut *c)
+    .await?;
+    sqlx::query(
+        "
+INSERT INTO
+connection_events(id,account_id,seq,from_status,to_status,reason,detail,created_at)
+VALUES(?,?,?,?,?,?,?,?)
+",
+    )
+    .bind(id())
+    .bind(a)
+    .bind(seq)
+    .bind(prev)
+    .bind(status)
+    .bind(reason)
+    .bind(reason)
+    .bind(t)
+    .execute(c)
+    .await?;
     Ok(())
 }
 
@@ -210,9 +285,22 @@ mod tests {
     async fn fixture() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("test.sqlite")).await.unwrap();
-        store.write(|c| Box::pin(async move {
-            sqlx::query("INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at) VALUES('a','ref','\"password\"','a@example.test','{}',0,0)").execute(c).await?; Ok(())
-        })).await.unwrap();
+        store
+            .write(|c| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "
+INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at)
+VALUES('a','ref','\"password\"','a@example.test','{}',0,0)
+",
+                    )
+                    .execute(c)
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
         (dir, store)
     }
     #[tokio::test]
@@ -275,7 +363,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seq, 6);
-        let ready: i64=sqlx::query_scalar("SELECT COUNT(*) FROM outbox o WHERE NOT EXISTS(SELECT 1 FROM outbox e WHERE e.message_key=o.message_key AND e.seq<o.seq AND e.state='pending')").fetch_one(&store.reads).await.unwrap();
+        let ready: i64 = sqlx::query_scalar(
+            "
+SELECT COUNT(*) FROM outbox o WHERE NOT EXISTS(SELECT 1 FROM outbox e WHERE
+e.message_key=o.message_key AND e.seq<o.seq AND e.state='pending')
+",
+        )
+        .fetch_one(&store.reads)
+        .await
+        .unwrap();
         assert_eq!(ready, 1);
     }
 }

@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, path::PathBuf};
 use thiserror::Error;
-
 pub fn now() -> i64 {
     Utc::now().timestamp()
 }
@@ -122,6 +121,12 @@ pub struct FileManifest {
     pub size: i64,
     pub sha256: String,
     pub content_id: Option<String>,
+    #[serde(default)]
+    pub content_disposition: Option<String>,
+    #[serde(default)]
+    pub content_description: Option<String>,
+    #[serde(default)]
+    pub content_location: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Message {

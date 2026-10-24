@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+zeroize.workspace = true
 epistle-core.workspace = true
 epistle-store.workspace = true
 epistle-auth.workspace = true

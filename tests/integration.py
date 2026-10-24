@@ -63,6 +63,8 @@ def main():
             schema=request("/openapi.json",auth=False)[2]
             assert "/email/messages/{id}/files/{file_id}" in schema["paths"]
             assert schema["paths"]["/email/accounts"]["post"]["security"]==[{"apiKey":[]}]
+            assert "201" in schema["paths"]["/email/accounts"]["post"]["responses"]
+            assert "202" in schema["paths"]["/email/messages/{id}/read"]["post"]["responses"]
             second=subprocess.run([str(ROOT/"target/debug/epistle-server")],env=env,capture_output=True,timeout=10)
             assert second.returncode!=0 and b"another instance" in second.stdout+second.stderr
             email="test-"+uuid.uuid4().hex+"@example.test"
@@ -151,6 +153,32 @@ def main():
             request(f"/email/accounts/{oa}/credentials","POST",{"refresh_token":"recovered-refresh"})
             eventually(lambda: request(f"/email/accounts/{oa}")[2]["status"]=="active")
             assert request(f"/email/accounts/{account}","PATCH",{"enabled":False})[2]["status"]=="disabled"
+            # A seeded mailbox model exercises arrivals, copies/moves, expunges and drops.
+            model_email="model-"+uuid.uuid4().hex+"@example.test"
+            model=mailbox(model_email);model.create("Sent")
+            _,_,created_model=request("/email/accounts","POST",{"external_ref":model_email,"email":model_email,"auth_kind":"password","config":{"host":"127.0.0.1","port":1143,"tls":False,"folders":["INBOX","Sent"]},"credentials":{"password":"test-password"}})
+            model_account=created_model["account"]["id"]
+            eventually(lambda:request(f"/email/accounts/{model_account}")[2]["status"]=="active")
+            rng=random.Random(20261024);expected=set();all_created=set()
+            for n in range(18):
+                message_id=uuid.uuid4().hex;expected.add(message_id);all_created.add(message_id)
+                model.append("INBOX",None,None,mail(message_id,"model"))
+                model.select("INBOX");uid=model.uid("search",None,"HEADER","Message-ID",f'"<{message_id}@example.test>"')[1][0]
+                action=rng.choice(["keep","move","expunge"])
+                if action=="move":model.uid("COPY",uid,"Sent")
+                if action in ("move","expunge"):
+                    model.uid("STORE",uid,"+FLAGS.SILENT",r"(\Deleted)");model.expunge()
+                if action=="expunge":expected.discard(message_id)
+            def delivered_model():
+                return {e["body"]["message"]["envelope"]["message_id"].split("@")[0] for e in events(model_account,"email.message.received")}
+            eventually(lambda: expected.issubset(delivered_model()))
+            assert delivered_model().issubset(all_created)
+            model_events=events(model_account,"email.message.received")
+            assert len({e["body"]["message"]["id"] for e in model_events})==len(model_events)
+            subprocess.run(["docker","compose","exec","-T","dovecot","doveadm","kick",model_email],cwd=ROOT,check=True,capture_output=True)
+            eventually(lambda:any(e["body"]["status"]=="reconnecting" for e in events(model_account,"account.status_changed")))
+            eventually(lambda:request(f"/email/accounts/{model_account}")[2]["status"]=="active")
+            request(f"/email/accounts/{model_account}","DELETE")
             # No credentials in SQLite plaintext; files expire from ack, with explicit 410 tombstones.
             with sqlite3.connect(pathlib.Path(data)/"epistle.sqlite") as db:
                 sealed=db.execute("SELECT ciphertext FROM credentials").fetchall()
@@ -160,7 +188,7 @@ def main():
             assert seqs==sorted(seqs) and len(seqs)==len(set(seqs))
             assert request(f"/email/accounts/{account}","DELETE")[0]==204
             assert request(f"/email/accounts/{account}")[0]==404
-            print("PASS: API auth/OpenAPI, lock, initial/live sync, MIME/files/ranges, signed delivery, read/unread, dedupe, backfills, restart, UIDVALIDITY fallback, dead replay, real XOAUTH2/refresh/revocation/recovery, encryption, retention, status ordering, removal",flush=True)
+            print("PASS: API auth/OpenAPI, lock, initial/live sync, MIME/files/ranges, signed delivery, read/unread, dedupe, backfills, restart, UIDVALIDITY fallback, dead replay, real XOAUTH2/refresh/revocation/recovery, encryption, retention, status ordering, seeded arrivals/moves/expunges/drop recovery, removal",flush=True)
         except BaseException:
             log.flush();log.seek(0);print(log.read())
             raise

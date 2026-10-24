@@ -13,8 +13,7 @@ use sqlx::Row;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
-
+use zeroize::{Zeroize, Zeroizing};
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("credential storage failed")]
@@ -35,7 +34,7 @@ pub enum Error {
     State,
 }
 // Intentionally no Debug: credentials must never appear in traces.
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize, Zeroize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Credentials {
     pub password: Option<String>,
@@ -175,7 +174,7 @@ impl TokenProvider {
             .lock_owned()
             .await
     }
-    pub async fn load(&self, a: &str) -> Result<Credentials, Error> {
+    pub async fn load(&self, a: &str) -> Result<Zeroizing<Credentials>, Error> {
         let sealed: Option<String> =
             sqlx::query_scalar("SELECT ciphertext FROM credentials WHERE account_id=?")
                 .bind(a)
@@ -184,7 +183,9 @@ impl TokenProvider {
         let bytes = self
             .vault
             .open(a, &sealed.ok_or(Error::Reauth("credentials_rejected"))?)?;
-        serde_json::from_slice(&bytes).map_err(|_| Error::Data)
+        serde_json::from_slice(&bytes)
+            .map(Zeroizing::new)
+            .map_err(|_| Error::Data)
     }
     pub fn encrypt_credentials(&self, a: &str, c: &Credentials) -> Result<String, Error> {
         self.vault.seal(
@@ -197,8 +198,13 @@ impl TokenProvider {
         let a = a.to_owned();
         let exp = c.access_expires_at;
         let scopes = serde_json::to_string(&c.scopes).map_err(|_| Error::Data)?;
-        self.store.write(move |db|Box::pin(async move { sqlx::query("INSERT INTO credentials(account_id,ciphertext,access_expires_at,scopes,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scopes=excluded.scopes,updated_at=excluded.updated_at")
-   .bind(a).bind(sealed).bind(exp).bind(scopes).bind(now()).execute(db).await?; Ok(()) })).await?;
+        self.store.write(move |db|Box::pin(async move { sqlx::query("
+INSERT INTO credentials(account_id,ciphertext,access_expires_at,scopes,updated_at)
+VALUES(?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
+ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,scopes=excluded.scopes,updated_at=excluded.updated_at
+")
+   .bind(a).bind(sealed).bind(exp).bind(scopes).bind(now()).execute(db).await?;
+ Ok(()) })).await?;
         Ok(())
     }
     pub async fn get_access_token(&self, a: &Account, force: bool) -> Result<Access, Error> {
@@ -208,6 +214,7 @@ impl TokenProvider {
             return Ok(Access {
                 secret: c
                     .password
+                    .clone()
                     .ok_or(Error::Reauth("credentials_rejected"))?
                     .into(),
                 expires_at: now() + 3600,
@@ -276,9 +283,10 @@ impl TokenProvider {
         };
         let response = self.exchange(&endpoint, &form).await?;
         self.apply_response(a, &mut c, response, false)?;
-        self.save(&a.id, &c).await?; // A rotated refresh token is durable before the access token leaves this function.
+        self.save(&a.id, &c).await?;
+        // A rotated refresh token is durable before the access token leaves this function.
         Ok(Access {
-            secret: c.access_token.ok_or(Error::Data)?.into(),
+            secret: c.access_token.clone().ok_or(Error::Data)?.into(),
             expires_at: c.access_expires_at.ok_or(Error::Data)?,
             password: false,
         })
@@ -297,6 +305,12 @@ impl TokenProvider {
                     "https://oauth2.googleapis.com/token".into()
                 }
             })
+    }
+    pub fn ensure_configured(&self, kind: AuthKind) -> Result<(), Error> {
+        if kind.oauth() {
+            self.client_credentials(kind)?;
+        }
+        Ok(())
     }
     fn client_credentials(&self, kind: AuthKind) -> Result<(String, String), Error> {
         let (id, secret) = if kind == AuthKind::MicrosoftOauth {
@@ -388,10 +402,31 @@ impl TokenProvider {
         let state_hash = hash(state.as_bytes());
         let account = a.id.clone();
         let revision = a.revision;
-        self.store.write(move |c|Box::pin(async move {
-   sqlx::query("DELETE FROM oauth_states WHERE account_id=? OR expires_at<?").bind(&account).bind(now()).execute(&mut *c).await?;
-   sqlx::query("INSERT INTO oauth_states(state_hash,account_id,encrypted_verifier,expires_at,revision) VALUES(?,?,?,?,?)").bind(state_hash).bind(account).bind(encrypted).bind(now()+600).bind(revision).execute(c).await?; Ok(())
-  })).await?;
+        self.store
+            .write(move |c| {
+                Box::pin(async move {
+                    sqlx::query("DELETE FROM oauth_states WHERE account_id=? OR expires_at<?")
+                        .bind(&account)
+                        .bind(now())
+                        .execute(&mut *c)
+                        .await?;
+                    sqlx::query(
+                        "
+INSERT INTO oauth_states(state_hash,account_id,encrypted_verifier,expires_at,revision)
+VALUES(?,?,?,?,?)
+",
+                    )
+                    .bind(state_hash)
+                    .bind(account)
+                    .bind(encrypted)
+                    .bind(now() + 600)
+                    .bind(revision)
+                    .execute(c)
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         let base = if a.auth_kind == AuthKind::MicrosoftOauth {
             format!(
                 "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
@@ -439,9 +474,24 @@ impl TokenProvider {
         )
         .map_err(|_| Error::State)?;
         let state_hash = hash(state.as_bytes());
-        let row=self.store.write(move |c|Box::pin(async move {
-   Ok(sqlx::query("DELETE FROM oauth_states WHERE state_hash=? AND expires_at>? RETURNING account_id,encrypted_verifier,revision").bind(state_hash).bind(now()).fetch_optional(c).await?)
-  })).await?.ok_or(Error::State)?;
+        let row = self
+            .store
+            .write(move |c| {
+                Box::pin(async move {
+                    Ok(sqlx::query(
+                        "
+DELETE FROM oauth_states WHERE state_hash=? AND expires_at>? RETURNING
+account_id,encrypted_verifier,revision
+",
+                    )
+                    .bind(state_hash)
+                    .bind(now())
+                    .fetch_optional(c)
+                    .await?)
+                })
+            })
+            .await?
+            .ok_or(Error::State)?;
         let account_id: String = row.try_get("account_id")?;
         let _guard = self.lock(&account_id).await;
         let a = self.store.account(&account_id).await?;

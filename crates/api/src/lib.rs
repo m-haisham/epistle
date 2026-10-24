@@ -30,7 +30,6 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
-
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
@@ -184,6 +183,43 @@ pub fn router(state: AppState) -> axum::Router {
             }
         }
     }
+    // StatusCode is dynamic at runtime; document the concrete success codes used here.
+    for (path, method, code) in [
+        ("/email/accounts", "post", "201"),
+        ("/email/accounts/{id}/backfills", "post", "202"),
+        ("/email/messages/{id}/read", "post", "202"),
+        ("/outbox/{id}/replay", "post", "202"),
+        ("/email/accounts/{id}", "delete", "204"),
+        ("/backfills/{id}", "delete", "204"),
+        ("/outbox/{id}", "delete", "204"),
+    ] {
+        if let Some(responses) = document
+            .get_mut("paths")
+            .and_then(|p| p.get_mut(path))
+            .and_then(|p| p.get_mut(method))
+            .and_then(|p| p.get_mut("responses"))
+            .and_then(Value::as_object_mut)
+        {
+            let success = responses
+                .remove("200")
+                .unwrap_or_else(|| json!({"description":"Success"}));
+            responses.insert(code.into(), success);
+        }
+    }
+    if let Some(operation) = document
+        .get_mut("paths")
+        .and_then(|p| p.get_mut("/email/messages/{id}/files/{file_id}"))
+        .and_then(|p| p.get_mut("get"))
+        .and_then(Value::as_object_mut)
+    {
+        let responses = operation.entry("responses").or_insert_with(|| json!({}));
+        if let Some(responses) = responses.as_object_mut() {
+            let binary = json!({"description":"File bytes","content":{"application/octet-stream":{"schema":{"type":"string","format":"binary"}}},"headers":{"ETag":{"schema":{"type":"string"}},"Content-Length":{"schema":{"type":"integer"}},"Accept-Ranges":{"schema":{"type":"string"}}}});
+            responses.insert("200".into(), binary.clone());
+            responses.insert("206".into(), binary);
+            responses.insert("304".into(), json!({"description":"Not modified"}));
+        }
+    }
     router
         .route("/openapi.json", axum::routing::get(openapi))
         .layer(Extension(Arc::new(document)))
@@ -270,19 +306,56 @@ async fn create_account(
     body.config
         .normalize(body.auth_kind, s.config.allow_insecure)
         .map_err(|e| ApiError::bad(e.to_string()))?;
-    let credentials: Credentials = body.credentials.into();
+    let credentials = zeroize::Zeroizing::new(Credentials::from(body.credentials));
     validate_credentials(body.auth_kind, &credentials)?;
+    s.tokens.ensure_configured(body.auth_kind)?;
     let account = id();
     let sealed = s.tokens.encrypt_credentials(&account, &credentials)?;
     let a = account.clone();
     let kind = serde_json::to_string(&body.auth_kind)?;
     let cfg = serde_json::to_string(&body.config)?;
     let oauth = body.auth_kind.oauth() && credentials.refresh_token.is_none();
-    s.store.write(move|c|Box::pin(async move{
-  sqlx::query("INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at) VALUES(?,?,?,?,?,?,?)").bind(&a).bind(body.external_ref).bind(kind).bind(body.email).bind(cfg).bind(now()).bind(now()).execute(&mut *c).await?;
-  sqlx::query("INSERT INTO credentials(account_id,ciphertext,updated_at) VALUES(?,?,?)").bind(&a).bind(sealed).bind(now()).execute(&mut *c).await?;
-  epistle_store::status_tx(c,&a,if oauth{"needs_reauth"}else{"connecting"},if oauth{Some("consent_required")}else{None},0).await
- })).await?;
+    s.store
+        .write(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "
+INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at)
+VALUES(?,?,?,?,?,?,?)
+",
+                )
+                .bind(&a)
+                .bind(body.external_ref)
+                .bind(kind)
+                .bind(body.email)
+                .bind(cfg)
+                .bind(now())
+                .bind(now())
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO credentials(account_id,ciphertext,updated_at) VALUES(?,?,?)",
+                )
+                .bind(&a)
+                .bind(sealed)
+                .bind(now())
+                .execute(&mut *c)
+                .await?;
+                epistle_store::status_tx(
+                    c,
+                    &a,
+                    if oauth { "needs_reauth" } else { "connecting" },
+                    if oauth {
+                        Some("consent_required")
+                    } else {
+                        None
+                    },
+                    0,
+                )
+                .await
+            })
+        })
+        .await?;
     let a = s.store.account(&account).await?;
     let redirect_url = if oauth {
         Some(s.tokens.authorization_url(&a).await?)
@@ -312,17 +385,49 @@ async fn update_credentials(
     Json(input): Json<CredentialInput>,
 ) -> Result<Json<AccountCreated>, ApiError> {
     let a = s.store.account(&id).await?;
-    let credentials: Credentials = input.into();
+    let credentials = zeroize::Zeroizing::new(Credentials::from(input));
     let oauth = a.auth_kind.oauth() && credentials.refresh_token.is_none();
     validate_credentials(a.auth_kind, &credentials)?;
     let _guard = s.tokens.lock(&id).await;
     let sealed = s.tokens.encrypt_credentials(&id, &credentials)?;
     let aid = id.clone();
-    s.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE credentials SET ciphertext=?,access_expires_at=NULL,scopes='[]',updated_at=? WHERE account_id=?").bind(sealed).bind(now()).bind(&aid).execute(&mut *c).await?;
-  sqlx::query("UPDATE accounts SET revision=revision+1,enabled=1 WHERE id=?").bind(&aid).execute(&mut *c).await?;
-  sqlx::query("DELETE FROM oauth_states WHERE account_id=?").bind(&aid).execute(&mut *c).await?;
-  epistle_store::status_tx(c,&aid,if oauth{"needs_reauth"}else{"connecting"},if oauth{Some("consent_required")}else{None},0).await
- })).await?;
+    s.store
+        .write(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "
+UPDATE credentials SET ciphertext=?,access_expires_at=NULL,scopes='[]',updated_at=?
+WHERE account_id=?
+",
+                )
+                .bind(sealed)
+                .bind(now())
+                .bind(&aid)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query("UPDATE accounts SET revision=revision+1,enabled=1 WHERE id=?")
+                    .bind(&aid)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM oauth_states WHERE account_id=?")
+                    .bind(&aid)
+                    .execute(&mut *c)
+                    .await?;
+                epistle_store::status_tx(
+                    c,
+                    &aid,
+                    if oauth { "needs_reauth" } else { "connecting" },
+                    if oauth {
+                        Some("consent_required")
+                    } else {
+                        None
+                    },
+                    0,
+                )
+                .await
+            })
+        })
+        .await?;
     let a = s.store.account(&id).await?;
     let redirect_url = if oauth {
         Some(s.tokens.authorization_url(&a).await?)
@@ -460,7 +565,32 @@ async fn mark_read(
 ) -> Result<(StatusCode, Json<CommandCreated>), ApiError> {
     let command_id = id();
     let cid = command_id.clone();
-    s.store.write(move|c|Box::pin(async move{let account:Option<String>=sqlx::query_scalar("SELECT account_id FROM message_index WHERE message_key=?").bind(&mid).fetch_optional(&mut *c).await?;let account=account.ok_or(epistle_store::Error::NotFound)?;sqlx::query("INSERT INTO commands(id,account_id,message_key,kind,read_value,created_at) VALUES(?,?,?,'mark_read',?,?)").bind(cid).bind(account).bind(mid).bind(body.read).bind(now()).execute(c).await?;Ok(())})).await?;
+    s.store
+        .write(move |c| {
+            Box::pin(async move {
+                let account: Option<String> =
+                    sqlx::query_scalar("SELECT account_id FROM message_index WHERE message_key=?")
+                        .bind(&mid)
+                        .fetch_optional(&mut *c)
+                        .await?;
+                let account = account.ok_or(epistle_store::Error::NotFound)?;
+                sqlx::query(
+                    "
+INSERT INTO commands(id,account_id,message_key,kind,read_value,created_at)
+VALUES(?,?,?,'mark_read',?,?)
+",
+                )
+                .bind(cid)
+                .bind(account)
+                .bind(mid)
+                .bind(body.read)
+                .bind(now())
+                .execute(c)
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
     Ok((StatusCode::ACCEPTED, Json(CommandCreated { command_id })))
 }
 #[derive(Deserialize, JsonSchema, Default)]
@@ -541,7 +671,35 @@ async fn create_backfill(
     }
     let job = id();
     let j = job.clone();
-    s.store.write(move|c|Box::pin(async move{sqlx::query("INSERT INTO backfill_jobs(id,account_id,since,until,folders_json,unread_only,redeliver,created_at) VALUES(?,?,?,?,?,?,?,?)").bind(j).bind(account).bind(input.since.timestamp()).bind(input.until.map(|u|u.timestamp())).bind(input.folders.map(|f|serde_json::to_string(&f)).transpose()?).bind(input.unread_only).bind(input.redeliver).bind(now()).execute(c).await?;Ok(())})).await?;
+    s.store
+        .write(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "
+INSERT INTO
+backfill_jobs(id,account_id,since,until,folders_json,unread_only,redeliver,created_at)
+VALUES(?,?,?,?,?,?,?,?)
+",
+                )
+                .bind(j)
+                .bind(account)
+                .bind(input.since.timestamp())
+                .bind(input.until.map(|u| u.timestamp()))
+                .bind(
+                    input
+                        .folders
+                        .map(|f| serde_json::to_string(&f))
+                        .transpose()?,
+                )
+                .bind(input.unread_only)
+                .bind(input.redeliver)
+                .bind(now())
+                .execute(c)
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(BackfillCreated { backfill_id: job }),
@@ -631,16 +789,88 @@ async fn list_outbox(State(s): State<AppState>) -> Result<Json<Vec<OutboxItem>>,
     ))
 }
 async fn replay(State(s): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, ApiError> {
-    s.store.write(move|c|Box::pin(async move{let changed=sqlx::query("UPDATE outbox SET state='pending',attempts=0,next_attempt_at=0,last_error=NULL WHERE seq=? AND state='dead'").bind(id).execute(c).await?.rows_affected();if changed==0{return Err(epistle_store::Error::Conflict("delivery_not_dead"));}Ok(())})).await?;
+    s.store
+        .write(move |c| {
+            Box::pin(async move {
+                let changed = sqlx::query(
+                    "
+UPDATE outbox SET state='pending',attempts=0,next_attempt_at=0,last_error=NULL WHERE
+seq=? AND state='dead'
+",
+                )
+                .bind(id)
+                .execute(c)
+                .await?
+                .rows_affected();
+                if changed == 0 {
+                    return Err(epistle_store::Error::Conflict("delivery_not_dead"));
+                }
+                Ok(())
+            })
+        })
+        .await?;
     Ok(StatusCode::ACCEPTED)
 }
 async fn discard(State(s): State<AppState>, Path(id): Path<i64>) -> Result<StatusCode, ApiError> {
     let retention = s.config.file_retention_secs;
-    s.store.write(move|c|Box::pin(async move{let key:Option<String>=sqlx::query_scalar("DELETE FROM outbox WHERE seq=? AND state='dead' RETURNING message_key").bind(id).fetch_optional(&mut *c).await?;let key=key.ok_or(epistle_store::Error::Conflict("delivery_not_dead"))?;sqlx::query("UPDATE message_files SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(&key).execute(&mut *c).await?;sqlx::query("UPDATE message_payloads SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(&key).execute(&mut *c).await?;sqlx::query("UPDATE messages SET expires_at=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&key).bind(key).execute(c).await?;Ok(())})).await?;
+    s.store
+        .write(move |c| {
+            Box::pin(async move {
+                let key: Option<String> = sqlx::query_scalar(
+                    "DELETE FROM outbox WHERE seq=? AND state='dead' RETURNING message_key",
+                )
+                .bind(id)
+                .fetch_optional(&mut *c)
+                .await?;
+                let key = key.ok_or(epistle_store::Error::Conflict("delivery_not_dead"))?;
+                sqlx::query(
+                    "
+UPDATE message_files SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM
+outbox WHERE message_key=?)
+",
+                )
+                .bind(now() + retention)
+                .bind(&key)
+                .bind(&key)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "
+UPDATE message_payloads SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1
+FROM outbox WHERE message_key=?)
+",
+                )
+                .bind(now() + retention)
+                .bind(&key)
+                .bind(&key)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "
+UPDATE messages SET expires_at=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE
+message_key=?)
+",
+                )
+                .bind(now() + retention)
+                .bind(&key)
+                .bind(key)
+                .execute(c)
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn health(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let r=sqlx::query("SELECT COUNT(*) AS depth,MIN(CASE WHEN state='pending' THEN created_at END) AS oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox").fetch_one(&s.store.reads).await?;
+    let r = sqlx::query(
+        "
+SELECT COUNT(*) AS depth,MIN(CASE WHEN state='pending' THEN created_at END) AS
+oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
+",
+    )
+    .fetch_one(&s.store.reads)
+    .await?;
     let accounts = s.store.accounts().await?;
     let mut account_health = vec![];
     for a in accounts {

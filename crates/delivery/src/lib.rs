@@ -11,7 +11,6 @@ use std::{
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("file storage failed")]
@@ -34,6 +33,9 @@ pub struct FileDraft {
     pub filename: String,
     pub content_type: String,
     pub content_id: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_description: Option<String>,
+    pub content_location: Option<String>,
     pub bytes: Vec<u8>,
 }
 #[derive(Clone)]
@@ -65,27 +67,68 @@ impl FileStore {
     ) -> Result<Prepared, Error> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
-   // A new immutable generation prevents a crash during redelivery from overwriting retained files.
-   let dir=root.join(&message.id).join(id());std::fs::create_dir_all(&dir)?;
-   let mut files=vec![];
-   for d in drafts {
-    let fid=id();let path=dir.join(&fid);let digest=hash(&d.bytes);let size=d.bytes.len() as i64;
-    durable_write(&path,&d.bytes)?;
-    let manifest=FileManifest{id:fid,role:d.role,filename:d.filename,content_type:d.content_type,size,sha256:digest,content_id:d.content_id};
-    message.files.push(manifest.clone());files.push(StoredFile{manifest,path:path.to_string_lossy().into_owned()});
-   }
-   let payload=serde_json::to_vec(&serde_json::json!({"id":id(),"kind":"email.message.received","channel":"email","idempotency_key":event_key,"message":message}))?;
-   let payload_path=dir.join("payload.json");durable_write(&payload_path,&payload)?;
-   std::fs::File::open(&dir)?.sync_all()?;
-   std::fs::File::open(root.join(&message.id))?.sync_all()?;
-   std::fs::File::open(&root)?.sync_all()?;
-   Ok(Prepared{message,files,payload_path:payload_path.to_string_lossy().into_owned(),payload_size:payload.len() as i64})
-  }).await?
+            // Immutable generations prevent redelivery from overwriting retained files.
+            let dir = root.join(&message.id).join(id());
+            std::fs::create_dir_all(&dir)?;
+            let mut files = vec![];
+            for d in drafts {
+                let fid = id();
+                let path = dir.join(&fid);
+                durable_write(&path, &d.bytes)?;
+                let manifest = FileManifest {
+                    id: fid,
+                    role: d.role,
+                    filename: d.filename,
+                    content_type: d.content_type,
+                    size: d.bytes.len() as i64,
+                    sha256: hash(&d.bytes),
+                    content_id: d.content_id,
+                    content_disposition: d.content_disposition,
+                    content_description: d.content_description,
+                    content_location: d.content_location,
+                };
+                message.files.push(manifest.clone());
+                files.push(StoredFile {
+                    manifest,
+                    path: path.to_string_lossy().into_owned(),
+                });
+            }
+            let event = serde_json::json!({
+                "id":id(),
+                "kind":"email.message.received",
+                "channel":"email",
+                "idempotency_key":format!("email:{}",hash(event_key.as_bytes())),
+                "message":message,
+            });
+            let payload = serde_json::to_vec(&event)?;
+            let payload_path = dir.join("payload.json");
+            durable_write(&payload_path, &payload)?;
+            std::fs::File::open(&dir)?.sync_all()?;
+            std::fs::File::open(root.join(&message.id))?.sync_all()?;
+            std::fs::File::open(&root)?.sync_all()?;
+            Ok(Prepared {
+                message,
+                files,
+                payload_path: payload_path.to_string_lossy().into_owned(),
+                payload_size: payload.len() as i64,
+            })
+        })
+        .await?
     }
     pub async fn sweep(&self, store: &Store, config: &Config, startup: bool) -> Result<(), Error> {
         tokio::fs::create_dir_all(&self.root).await?;
         let pressure = fs2::available_space(&self.root)? < config.disk_reserve_bytes;
-        let rows=sqlx::query("SELECT file_id,path FROM message_files WHERE expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_files.message_key)").bind(now()).bind(pressure).fetch_all(&store.reads).await?;
+        let rows = sqlx::query(
+            "
+SELECT file_id,path FROM message_files WHERE expired=0 AND expires_at IS NOT NULL AND
+(expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE
+outbox.message_key=message_files.message_key)
+",
+        )
+        .bind(now())
+        .bind(pressure)
+        .fetch_all(&store.reads)
+        .await?;
         for row in rows {
             let fid: String = row.try_get("file_id")?;
             let path: String = row.try_get("path")?;
@@ -102,7 +145,17 @@ impl FileStore {
                 })
                 .await?;
         }
-        let rows=sqlx::query("SELECT id,payload_path FROM messages WHERE expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=messages.id)").bind(now()).bind(pressure).fetch_all(&store.reads).await?;
+        let rows = sqlx::query(
+            "
+SELECT id,payload_path FROM messages WHERE expired=0 AND expires_at IS NOT NULL AND
+(expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE
+outbox.message_key=messages.id)
+",
+        )
+        .bind(now())
+        .bind(pressure)
+        .fetch_all(&store.reads)
+        .await?;
         for row in rows {
             let mid: String = row.try_get("id")?;
             let path: String = row.try_get("payload_path")?;
@@ -110,8 +163,9 @@ impl FileStore {
             store
                 .write(move |c| {
                     Box::pin(async move {
-                        sqlx::query("UPDATE messages SET expired=1 WHERE id=?")
+                        sqlx::query("UPDATE messages SET expired=1 WHERE id=? AND payload_path=?")
                             .bind(mid)
+                            .bind(path)
                             .execute(c)
                             .await?;
                         Ok(())
@@ -119,7 +173,17 @@ impl FileStore {
                 })
                 .await?;
         }
-        let payloads=sqlx::query("SELECT path FROM message_payloads WHERE expired=0 AND expires_at IS NOT NULL AND (expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_payloads.message_key)").bind(now()).bind(pressure).fetch_all(&store.reads).await?;
+        let payloads = sqlx::query(
+            "
+SELECT path FROM message_payloads WHERE expired=0 AND expires_at IS NOT NULL AND
+(expires_at<=? OR ?=1) AND NOT EXISTS(SELECT 1 FROM outbox WHERE
+outbox.message_key=message_payloads.message_key)
+",
+        )
+        .bind(now())
+        .bind(pressure)
+        .fetch_all(&store.reads)
+        .await?;
         for row in payloads {
             let path: String = row.try_get("path")?;
             remove_if_exists(&path).await?;
@@ -136,12 +200,38 @@ impl FileStore {
                 .await?;
         }
         let cutoff = now() - config.index_retention_secs;
-        store.write(move|c|Box::pin(async move{
-   sqlx::query("DELETE FROM message_index WHERE created_at<? AND NOT EXISTS(SELECT 1 FROM fetch_queue WHERE fetch_queue.message_key=message_index.message_key) AND NOT EXISTS(SELECT 1 FROM commands WHERE commands.message_key=message_index.message_key AND state='pending') AND NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_index.message_key)").bind(cutoff).execute(&mut *c).await?;
-   sqlx::query("DELETE FROM oauth_states WHERE expires_at<?").bind(now()).execute(c).await?;Ok(())
-  })).await?;
+        store
+            .write(move |c| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "
+DELETE FROM message_index WHERE created_at<? AND NOT EXISTS(SELECT 1 FROM fetch_queue
+WHERE fetch_queue.message_key=message_index.message_key) AND NOT EXISTS(SELECT 1 FROM
+commands WHERE commands.message_key=message_index.message_key AND state='pending') AND
+NOT EXISTS(SELECT 1 FROM outbox WHERE outbox.message_key=message_index.message_key)
+",
+                    )
+                    .bind(cutoff)
+                    .execute(&mut *c)
+                    .await?;
+                    sqlx::query("DELETE FROM oauth_states WHERE expires_at<?")
+                        .bind(now())
+                        .execute(c)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         if startup {
-            let rows:Vec<String>=sqlx::query_scalar("SELECT path FROM message_files WHERE expired=0 UNION SELECT payload_path FROM outbox WHERE payload_path IS NOT NULL UNION SELECT path FROM message_payloads WHERE expired=0 UNION SELECT payload_path FROM messages WHERE expired=0").fetch_all(&store.reads).await?;
+            let rows: Vec<String> = sqlx::query_scalar(
+                "
+SELECT path FROM message_files WHERE expired=0 UNION SELECT payload_path FROM outbox
+WHERE payload_path IS NOT NULL UNION SELECT path FROM message_payloads WHERE expired=0
+UNION SELECT payload_path FROM messages WHERE expired=0
+",
+            )
+            .fetch_all(&store.reads)
+            .await?;
             let keep: HashSet<_> = rows.into_iter().collect();
             let root = self.root.clone();
             tokio::task::spawn_blocking(move || sweep_orphans(&root, &keep)).await??;
@@ -230,7 +320,16 @@ impl Delivery {
         })
     }
     pub async fn tick(&self) -> Result<usize, Error> {
-        let rows=sqlx::query("SELECT * FROM outbox o WHERE state='pending' AND next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM outbox earlier WHERE earlier.message_key=o.message_key AND earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16").bind(now()).fetch_all(&self.store.reads).await?;
+        let rows = sqlx::query(
+            "
+SELECT * FROM outbox o WHERE state='pending' AND next_attempt_at<=? AND NOT
+EXISTS(SELECT 1 FROM outbox earlier WHERE earlier.message_key=o.message_key AND
+earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
+",
+        )
+        .bind(now())
+        .fetch_all(&self.store.reads)
+        .await?;
         let count = rows.len();
         let mut tasks = tokio::task::JoinSet::new();
         for row in rows {
@@ -259,7 +358,7 @@ impl Delivery {
             .header("content-type", "application/json")
             .header("x-epistle-timestamp", timestamp.to_string())
             .header("x-epistle-signature", sig)
-            .header("idempotency-key", key)
+            .header("idempotency-key", format!("email:{}", hash(key.as_bytes())))
             .header("x-epistle-delivery-id", seq.to_string())
             .body(body)
             .send()
@@ -268,13 +367,60 @@ impl Delivery {
         if status.is_some_and(|s| (200..300).contains(&s)) {
             let retention = self.config.file_retention_secs;
             let backfill_id: Option<String> = row.try_get("backfill_id")?;
-            self.store.write(move|c|Box::pin(async move{
-    sqlx::query("DELETE FROM outbox WHERE seq=?").bind(seq).execute(&mut *c).await?;
-    sqlx::query("UPDATE message_files SET delivered_at=COALESCE(delivered_at,?),expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()).bind(now()+retention).bind(&message_key).bind(&message_key).execute(&mut *c).await?;
-    sqlx::query("UPDATE messages SET delivered_at=COALESCE(delivered_at,?),expires_at=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()).bind(now()+retention).bind(&message_key).bind(&message_key).execute(&mut *c).await?;
-    sqlx::query("UPDATE message_payloads SET expires_at=? WHERE message_key=? AND expired=0 AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)").bind(now()+retention).bind(&message_key).bind(&message_key).execute(&mut *c).await?;
-    if let Some(job)=backfill_id{sqlx::query("UPDATE backfill_jobs SET delivered=delivered+1 WHERE id=?").bind(job).execute(&mut *c).await?;}Ok(())
-   })).await?;
+            self.store
+                .write(move |c| {
+                    Box::pin(async move {
+                        sqlx::query("DELETE FROM outbox WHERE seq=?")
+                            .bind(seq)
+                            .execute(&mut *c)
+                            .await?;
+                        sqlx::query(
+                            "
+UPDATE message_files SET delivered_at=COALESCE(delivered_at,?),expires_at=? WHERE
+message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
+",
+                        )
+                        .bind(now())
+                        .bind(now() + retention)
+                        .bind(&message_key)
+                        .bind(&message_key)
+                        .execute(&mut *c)
+                        .await?;
+                        sqlx::query(
+                            "
+UPDATE messages SET delivered_at=COALESCE(delivered_at,?),expires_at=? WHERE id=? AND
+NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
+",
+                        )
+                        .bind(now())
+                        .bind(now() + retention)
+                        .bind(&message_key)
+                        .bind(&message_key)
+                        .execute(&mut *c)
+                        .await?;
+                        sqlx::query(
+                            "
+UPDATE message_payloads SET expires_at=? WHERE message_key=? AND expired=0 AND NOT
+EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
+",
+                        )
+                        .bind(now() + retention)
+                        .bind(&message_key)
+                        .bind(&message_key)
+                        .execute(&mut *c)
+                        .await?;
+                        if let Some(job) = backfill_id {
+                            sqlx::query(
+                                "UPDATE backfill_jobs SET delivered=delivered+1 WHERE id=?",
+                            )
+                            .bind(job)
+                            .execute(&mut *c)
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await?;
         } else {
             let attempts = row.try_get::<i64, _>("attempts")? + 1;
             let retryable = status.is_none_or(|s| s >= 500 || s == 408 || s == 429);
@@ -290,7 +436,8 @@ impl Delivery {
             let reason = status
                 .map(|s| format!("http_{s}"))
                 .unwrap_or_else(|| "network_error".into());
-            self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE outbox SET state=?,attempts=?,next_attempt_at=?,last_error=? WHERE seq=?").bind(if dead{"dead"}else{"pending"}).bind(attempts).bind(now()+delay).bind(reason).bind(seq).execute(c).await?;Ok(())})).await?;
+            self.store.write(move|c|Box::pin(async move{sqlx::query("UPDATE outbox SET state=?,attempts=?,next_attempt_at=?,last_error=? WHERE seq=?").bind(if dead{"dead"}else{"pending"}).bind(attempts).bind(now()+delay).bind(reason).bind(seq).execute(c).await?;
+Ok(())})).await?;
             if dead {
                 tracing::error!(
                     delivery_id = seq,
@@ -302,7 +449,8 @@ impl Delivery {
     }
     pub async fn run(self, cancel: CancellationToken) {
         loop {
-            tokio::select! {_ = cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{if let Err(e)=self.tick().await{tracing::error!(error=%e,"delivery tick failed");}}}
+            tokio::select! {_ = cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{if let Err(e)=self.tick().await{tracing::error!(error=%e,"delivery tick failed");
+            }}}
         }
     }
 }
