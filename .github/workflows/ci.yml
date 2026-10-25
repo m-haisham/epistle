@@ -24,6 +24,7 @@ jobs:
       - run: python3 tests/token_expiry.py --image epistle-epistle:latest
       - run: python3 tests/recovery.py --image epistle-epistle:latest
       - run: python3 tests/shutdown.py --image epistle-epistle:latest
+      - run: python3 tests/sending.py --image epistle-epistle:latest
       - if: failure()
         run: docker compose logs
       - if: always()

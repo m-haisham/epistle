@@ -27,6 +27,12 @@ webhook_url = "https://app.example.com/webhooks/email"
 max_attempts = 12
 # EPISTLE_DELIVERY__WEBHOOK_SECRET: at least 32 characters.
 
+[sending]
+workers = 4                     # 1–32; at most one active send per account
+max_attempts = 12
+timeout_secs = 60                # Per connect, auth and submission phase
+max_message_bytes = 1_048_576     # Encoded MIME; HTTP JSON limit is 2 MiB
+
 [auth]
 reauth_reminder_secs = 0         # Disabled
 # EPISTLE_AUTH__MASTER_KEY: 32 random bytes encoded as 64 hex characters.

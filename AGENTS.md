@@ -1,6 +1,6 @@
 # Working on Epistle
 
-Epistle is a single-tenant Rust IMAP ingestion service. Read [README.md](README.md) for setup, [docs/spec.md](docs/spec.md) for the original v1 requirements, and [docs/operations.md](docs/operations.md) for runtime contracts. [docs/spec-review.md](docs/spec-review.md) records reviewed gaps and scope boundaries. Preserve the original specification unless the user asks to change it.
+Epistle is a single-tenant Rust email ingestion and submission service. Read [README.md](README.md) for setup, [docs/spec.md](docs/spec.md) for the original v1 requirements, and [docs/operations.md](docs/operations.md) for runtime contracts. [docs/spec-review.md](docs/spec-review.md) records reviewed gaps and scope boundaries. Preserve the original specification unless the user asks to change it.
 
 ## Repository map
 
@@ -9,6 +9,7 @@ Epistle is a single-tenant Rust IMAP ingestion service. Read [README.md](README.
 - `crates/auth`: encrypted credentials, consent and token lifecycle.
 - `crates/imap`: protocol handling and bounded sessions.
 - `crates/email`: supervision, discovery, parsing, backfills and commands.
+- `crates/send`: MIME composition, shared-credential SMTP and durable send jobs.
 - `crates/delivery`: durable files, retention and webhook outbox.
 - `crates/api`: Axum routes, OpenAPI and Scalar.
 - `crates/server`: startup, tracing and shutdown.
@@ -34,6 +35,7 @@ The adjacent `../hark` project is an incomplete reference, especially for email 
 - Flush immutable payload/file generations before transactional handoff. Retention commits an expired marker before unlinking; pending/dead deliveries retain their files.
 - Keep acknowledgment and outbox state changes transactional. Delivery is at least once; retries retain the same idempotency key. Independent delivery groups must not cancel one another.
 - Serialize refreshes per account and persist replacement credentials before exposing the access token. Preserve known refresh deadlines unless the provider or new consent replaces them. Do not assume rotation prevents expiry or that a lost replacement is always recoverable.
+- Persist the SMTP submission marker before sending. Interrupted preparation can retry; an interrupted submission is unknown and must not replay automatically. SMTP acceptance is not recipient delivery.
 - Respect process epochs and account revisions. Provider outages must not exhaust per-message work; missing folders must not stop healthy folders.
 - Cancellation stops new work at durable boundaries. Drain in-flight refreshes, fetch/handoff, commands, webhook acknowledgments and accepted database writes. Interrupt idle/backoff waits promptly; retain watchdogs on network operations.
 - Await workers and close the store before releasing the instance lock. Do not reintroduce blanket task abortion or a fixed internal shutdown cutoff.

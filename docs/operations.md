@@ -9,6 +9,7 @@
 | `[server]` | Listener, public URL and API key |
 | `[storage]` | Data directory, retention and disk reserve |
 | `[mail]`, `[mail.fetch]` | IMAP watchdog/reconciliation, body limits and batch size |
+| `[sending]` | SMTP workers, watchdog, retry budget and MIME size cap |
 | `[delivery]` | Webhook destination, signing secret and retries |
 | `[auth]` | Master key and reauthorization reminders |
 | `[auth.google]`, `[auth.microsoft]` | OAuth client credentials |
@@ -28,9 +29,9 @@ Secrets and provider credentials:
 
 Keep SQLite and the file store on one local persistent volume. An OS lock prevents two processes owning the same data directory. An epoch checked inside every write transaction fences stale writers. The SQLx read pool is read-only; a bounded channel feeds one dedicated write connection. Migration checksums detect changed historical migrations.
 
-Stop the old instance before deploying a replacement. SIGTERM or SIGINT stops accepting HTTP connections and new worker work. Existing HTTP handlers, OAuth exchanges, message handoffs, read commands and webhook batches finish before the database writer drains and closes. The instance lock remains held until this completes. Idle sessions and backoff waits stop promptly; network operations retain their watchdogs. Shutdown does not forcibly abort work after a fixed timeout.
+Stop the old instance before deploying a replacement. SIGTERM or SIGINT stops accepting HTTP connections and new worker work. Existing HTTP handlers, OAuth exchanges, message handoffs, read commands, in-flight SMTP submissions and webhook batches finish before the database writer drains and closes. The instance lock remains held until this completes. Idle sessions and backoff waits stop promptly; network operations retain their watchdogs. Shutdown does not forcibly abort work after a fixed timeout.
 
-Give the process enough time to drain: Compose allows five minutes, and manual container stops should use `docker stop --time 300`. Large file writes or slow clients can need longer. SIGKILL or an external stop deadline still bypasses graceful shutdown. Restart resumes durable cursors and queues; a remotely accepted webhook whose acknowledgment was not committed may be redelivered with the same idempotency key. Queue claims are in memory, so there are no persisted leases to clear. On startup, unreferenced file generations are removed. Database transactions and filesystem `fsync` make the file-to-outbox handoff recoverable.
+Give the process enough time to drain: Compose allows five minutes, and manual container stops should use `docker stop --time 300`. Large file writes or slow clients can need longer. SIGKILL or an external stop deadline still bypasses graceful shutdown. Restart resumes durable cursors and queues; a remotely accepted webhook whose acknowledgment was not committed may be redelivered with the same idempotency key. IMAP/webhook queue claims are in memory. SMTP preparation claims return to pending on restart; submission claims become unknown as described below. On startup, unreferenced file generations are removed. Database transactions and filesystem `fsync` make the file-to-outbox handoff recoverable.
 
 The server installs `tracing-subscriber` once. Set `RUST_LOG=info,epistle_email=debug,epistle_auth=debug` for account and token diagnostics. Structured spans correlate account IDs, worker roles, delivery IDs and HTTP request IDs. HTTP traces record route templates, status and latency, excluding query strings, headers and bodies. Application instrumentation skips credentials and message contents. The `shutdown complete` event confirms that workers and database writes drained.
 
@@ -137,3 +138,50 @@ Open `/scalar` for the interactive API reference or `/openapi.json` for client g
 IMAP metadata, search and flag results are accepted only after a tagged OK completion. NO/BAD responses, including errors following partial results, preserve pending work instead of advancing cursors, marking messages gone or reporting commands done. A UIDVALIDITY fallback verifies exact Message-ID equality because IMAP HEADER searches are substring matches.
 
 Missing webhook payloads become dead with `payload_missing`; remaining files stay retained. Restore the payload before replay, or discard and request a redelivery backfill. Independent webhook deliveries continue even when another delivery's acknowledgment transaction fails. See `spec-review.md` for the complete review and its test coverage.
+
+## Outbound email
+
+`POST /email/accounts/{id}/send` accepts a required `idempotency_key`, `subject`, recipient arrays (`to`, `cc`, `bcc`) and at least one of `text` or `html`. Optional fields are `reply_to`, `in_reply_to`, `references` and base64 `attachments`. Reply/thread identifiers use angle brackets, for example `<original@example.com>`. The sender is fixed to the selected account. MIME encoding handles Unicode headers and attachments; Bcc is stripped from headers while retaining envelope recipients. There are at most 100 recipients, 32 attachments and 50 references per message. Encoded MIME defaults to 1 MiB (`sending.max_message_bytes`); HTTP JSON remains capped at 2 MiB, including base64 data. Raising the MIME limit does not raise that HTTP limit.
+
+The immutable MIME bytes, envelope, generated Message-ID and request hash commit together in SQLite before HTTP 202. Idempotency is scoped to the account and retained for the life of the job. Identical deserialized requests return the original job, including after HTTP response loss; changed content under the same key returns 409. Recipients and message contents are not returned by the status endpoint or logged. Outbound payloads and status are currently retained in SQLite until account deletion; include their disk usage and sensitive content in backup/retention planning. The inbound file-retention settings do not apply to this queue.
+
+### SMTP configuration and providers
+
+Account creation accepts `config.smtp: {"host":"smtp.example.com","port":587,"security":"starttls"}`. Existing accounts can use `POST /email/accounts/{id}/smtp` with that object. No separate SMTP credential is stored. The username and envelope sender are the account email, and authentication uses the existing password, Google/Microsoft OAuth token, or delegated Google service-account token. Provider accounts created before this feature also resolve defaults:
+
+| Account | Default SMTP endpoint | Security |
+| --- | --- | --- |
+| Google OAuth / Workspace service account | `smtp.gmail.com:465` | Implicit TLS |
+| Microsoft OAuth | `smtp.office365.com:587` | Required STARTTLS |
+| Microsoft with `config.tenant: "consumers"` | `smtp-mail.outlook.com:587` | Required STARTTLS |
+| Password | Explicit `config.smtp` required | TLS or required STARTTLS |
+
+Explicit endpoints override provider defaults. Outlook.com users using the default `common` tenant should configure the Outlook.com endpoint explicitly. STARTTLS must be advertised and complete successfully before authentication; TLS uses certificate and hostname verification. `plain` requires `testing.allow_insecure_endpoints` and is only for local fixtures. OAuth uses XOAUTH2; password authentication uses PLAIN/LOGIN inside the secured connection.
+
+Google's existing `https://mail.google.com/` grant covers SMTP, including appropriately delegated service accounts. Microsoft needs delegated `https://outlook.office.com/SMTP.Send`; Epistle already requests it during consent. An existing IMAP-only grant must be reauthorized through `POST /email/accounts/{id}/credentials` with `{}`. A known missing scope fails the send job with `smtp_scope_missing_reauthorize`. Microsoft 365 also requires SMTP AUTH permitted by organization/mailbox policy. A scope grant does not override that policy. References: [Google SMTP/OAuth](https://developers.google.com/workspace/gmail/imap/imap-smtp), [Microsoft OAuth permissions](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth), [Microsoft SMTP AUTH configuration](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/authenticated-client-smtp-submission), and [Outlook.com settings](https://support.microsoft.com/en-us/outlook/pop-imap-and-smtp-settings-for-outlook-com).
+
+Each attempt obtains access through the same per-account token provider as IMAP. Expired tokens refresh before authentication; replacement credentials persist before use. An OAuth SMTP authentication rejection triggers one forced refresh and reconnect. Subsequent rejection fails the job without incorrectly changing a working IMAP account's status. Existing refresh expiry and crash-window limits still apply.
+
+### Submission and recovery
+
+Poll `GET /email/sends/{id}`. `GET /email/sends` lists newest jobs with optional `account_id`, `state`, `limit` (1–100, default 50), and `offset` filters. `/health` includes pending/active/failed/unknown send counts. Status includes attempt count, sanitized `last_error`, next attempt timestamp and SMTP `accepted_at`:
+
+| State | Meaning / recovery |
+| --- | --- |
+| `pending` | Durable work, waiting for a worker or retry deadline; disabled accounts pause here. |
+| `preparing` | Connecting/authenticating; no SMTP message transaction has started. Restart safely returns this to pending. |
+| `sending` | Durable marker committed before the SMTP transaction. |
+| `sent` | SMTP returned acceptance after DATA. This is not proof of recipient delivery. |
+| `failed` | Permanent rejection, missing consent/configuration or exhausted safe retries. Correct the cause, then retry explicitly. |
+| `unknown` | Lost/invalid response, timeout or process crash during submission. Provider acceptance is possible. No automatic replay. |
+| `cancelled` | Cancelled before a worker claim; never submitted. |
+
+Known SMTP 4xx rejections retry with capped jittered backoff, up to `sending.max_attempts` (12). A 5xx rejection fails the job. Recipient rejection aborts before DATA, so accepted earlier RCPT commands do not produce a partial delivery. Connection/authentication errors before submission can safely retry. Malformed responses and network loss during submission are conservatively unknown even when the provider may not have accepted anything. Failure to record a result stops the service for startup recovery rather than continuing with a stuck claim.
+
+`POST /email/sends/{id}/retry` with `{}` resets the attempt budget on `failed` jobs. Unknown outcomes require `{"allow_duplicate":true}`; inspect provider logs or the recipient mailbox first where practical. Retry reuses identical bytes and Message-ID, but SMTP does not guarantee deduplication by Message-ID. HTTP idempotency prevents duplicate queue entries; it cannot make remote SMTP acceptance atomic with local storage. SMTP acceptance does not track later bounces, delivery receipts or placement in a Sent folder. Epistle does not append a separate Sent copy; provider behavior varies.
+
+`DELETE /email/sends/{id}` cancels pending work and returns 409 once claimed. Disabling or changing an account prevents a prepared worker using a stale revision from starting submission; a transaction already in flight may finish. Deleting an account cascades its jobs, including idempotency history, and cannot recall email already submitted. Default concurrency is four workers (`sending.workers`, range 1–32), with at most one active send per account. A retrying account does not block other accounts.
+
+Shutdown stops new claims and drains any active SMTP transaction through its durable result. Preparation stops at the next safe boundary; idle workers stop promptly. Network phases are bounded by `sending.timeout_secs` (60). Restart after SIGKILL marks any `sending` job unknown, including the window between provider acceptance and storing `sent`. The same recovery applies if an external shutdown deadline kills the process while draining.
+
+`python3 tests/sending.py` exercises the host server; add `--image epistle-epistle:latest` for the GNU/glibc image. The fixture verifies real XOAUTH2 exchanges against short-lived synthetic tokens, uses the same accounts for IMAP and SMTP, kills the process after DATA, and signals shutdown while acceptance is delayed. These tests model protocol recovery and do not send to real recipients or validate tenant-specific policy.

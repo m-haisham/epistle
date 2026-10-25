@@ -37,10 +37,14 @@ Reviewed on 2026-10-25 against `docs/spec.md`. The original specification remain
 
 ## Scope and operational boundaries
 
-- The specification's deferred features remain deferred: outbound mail, flag/delete events, SMS/WhatsApp and a cap on undelivered bytes. Batch byte limits do not impose a maximum size on an individual email.
+- The specification's deferred features remain deferred except for user-requested outbound mail: flag/delete events, SMS/WhatsApp and a cap on undelivered bytes. Batch byte limits do not impose a maximum size on an individual email.
 - UID catch-up and reconciliation provide v1 new-message correctness. CONDSTORE is enabled when available; QRESYNC delta synchronization and flag/delete tracking are not implemented for this scope.
 - IMAP supports code-based error classification plus a narrow Dovecot compatibility case. Unrecognized provider failures remain retryable; real provider throttling, Gmail extensions and tenant-specific authentication restrictions require live acceptance tests.
 - Missing local payload data cannot be reconstructed without restoring the file or fetching mail again. The row is retained as dead rather than silently acknowledged. After repairing its stored payload, replay it; alternatively discard and request an explicit redelivery backfill.
 - A lost authorization-code response is not generally recoverable by retrying the single-use code. Start a new consent flow. Refresh-token crash recovery has separate Google/Microsoft tests and documented provider guarantees in `operations.md`.
 - Scalar loads a version-pinned, integrity-checked script from jsDelivr. Browser access to that CDN is needed for the interactive reference; `/openapi.json` remains directly available. API calls go to the current service origin without a third-party proxy, and bearer credentials are not persisted by Scalar.
 - Container recovery tests retain a temporary image tag throughout restarts so a concurrent image rebuild cannot switch or remove their binary. A harness regression retags the source image and checks that the pinned test image survives; disposable tags and volumes are cleaned up.
+
+## Outbound extension
+
+Outbound email was explicitly requested after v1. `crates/send` adds immutable MIME composition, shared password/OAuth credentials, provider SMTP defaults, SQLx send jobs, caller idempotency keys and polled status. New routes are documented in Scalar. Safe preparation retries after restart; interrupted submissions become `unknown` and require duplicate acknowledgment before retry. Synthetic SMTP/OAuth tests cover Bcc, attachments, recipient rejection, refresh, timeouts, crash recovery and graceful draining; the process suite also runs in the GNU/glibc container. Real-provider SMTP policy and delivery acceptance remain deployment checks.

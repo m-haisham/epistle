@@ -1,8 +1,11 @@
 """Local-only webhook recorder and deterministic OAuth issuer for integration tests."""
 import json, threading, time
+from smtp import start_smtp
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 state = {
+    "smtp_messages": [], "smtp_auth": [], "pause_smtp": False,
+    "blocked_smtp": 0, "disconnect_smtp": False,
     "events": [], "status": 200, "token_calls": 0, "revoked": False,
     "token_lifetime": 3600, "strict_rotation": False, "expected_refresh": None,
     "issued_tokens": {}, "refresh_history": [], "token_failures": 0,
@@ -62,9 +65,10 @@ class Handler(BaseHTTPRequestHandler):
                 state["issued_tokens"][access] = time.time() + state["token_lifetime"]
                 state["expected_refresh"] = refresh
                 state["refresh_history"].append({"used": supplied, "issued": refresh})
-                response = {"access_token": access, "refresh_token": refresh, "expires_in": state["token_lifetime"], "scope": "https://mail.google.com/ https://outlook.office.com/IMAP.AccessAsUser.All offline_access"}
+                response = {"access_token": access, "refresh_token": refresh, "expires_in": state["token_lifetime"], "scope": "https://mail.google.com/ https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access"}
                 if state["refresh_expires_at"] is not None:
                     response["refresh_token_expires_in"] = max(0, int(state["refresh_expires_at"] - time.time()))
                 return self.reply(200, response)
         self.reply(404, {})
+start_smtp(state, lock)
 ThreadingHTTPServer(("0.0.0.0", 8090), Handler).serve_forever()

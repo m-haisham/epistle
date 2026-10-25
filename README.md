@@ -1,12 +1,12 @@
 # Epistle
 
-Epistle is a single-tenant Rust service that ingests email over IMAP and delivers normalized messages through signed webhooks. It keeps synchronization cursors, pending work and delivery retries in SQLite, with message bodies and attachments on local disk.
+Epistle is a single-tenant Rust service that ingests email over IMAP and delivers normalized messages through signed webhooks, and sends email through the same accounts over SMTP. It keeps synchronization cursors, pending work and delivery retries in SQLite, with message bodies and attachments on local disk.
 
 ```text
 IMAP → discovery + durable fetch queue → MIME parsing + files → webhook outbox → your application
 ```
 
-It supports password authentication, Google OAuth, Microsoft OAuth and Google Workspace service accounts. Features include initial synchronization, live discovery, date-based backfills, read/unread commands, attachment downloads and recovery after disconnects or restarts.
+It supports password authentication, Google OAuth, Microsoft OAuth and Google Workspace service accounts. Features include initial synchronization, live discovery, date-based backfills, read/unread commands, durable outbound submissions, attachment downloads and recovery after disconnects or restarts.
 
 - [API reference](http://localhost:8080/scalar): `/scalar`, backed by `/openapi.json`.
 - [Operations guide](docs/operations.md): provider setup, configuration, delivery contracts and recovery.
@@ -21,13 +21,14 @@ Run from the repository root with Docker and Compose installed:
 docker compose up -d --build
 ```
 
-This starts Epistle, a local Dovecot IMAP server and a webhook/OAuth mock. The supplied credentials and plaintext IMAP settings are for local testing only.
+This starts Epistle, a local Dovecot IMAP server and a webhook/OAuth/SMTP mock. The supplied credentials and plaintext IMAP settings are for local testing only.
 
 | Service | Address |
 | --- | --- |
 | Epistle API and Scalar | `http://localhost:8080` |
 | Webhook recorder | `http://localhost:8090/events` |
 | Test IMAP server | `localhost:1143` |
+| Test SMTP server | `localhost:2525` |
 
 Create an account:
 
@@ -58,6 +59,36 @@ docker compose logs -f epistle
 docker compose stop
 ```
 
+## Send an email
+
+Use the account ID from registration. Google OAuth and service accounts default to `smtp.gmail.com:465` (TLS); Microsoft defaults to `smtp.office365.com:587` (required STARTTLS). For Outlook.com accounts, use `config.tenant: "consumers"` or configure `smtp-mail.outlook.com:587`. Microsoft requires `SMTP.Send` consent and SMTP AUTH enabled for the mailbox.
+
+Password accounts need SMTP settings, either in `config.smtp` during registration or through the configuration endpoint. For the local Compose fixture:
+
+```sh
+curl http://localhost:8080/email/accounts/ACCOUNT_ID/smtp \
+  -H 'Authorization: Bearer local-test-api-key-0000000000000000' \
+  -H 'Content-Type: application/json' \
+  -d '{"host":"mock","port":2525,"security":"plain"}'
+
+curl http://localhost:8080/email/accounts/ACCOUNT_ID/send \
+  -H 'Authorization: Bearer local-test-api-key-0000000000000000' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "idempotency_key":"order-123-confirmation",
+    "to":["recipient@example.test"],
+    "subject":"Order confirmation",
+    "text":"Your order is confirmed.",
+    "html":"<p>Your order is confirmed.</p>"
+  }'
+```
+
+Production endpoints use `security: "tls"` or `"starttls"`; plaintext is only permitted by the testing opt-in. SMTP uses the account email and its existing password or OAuth token. `From` cannot be overridden. Optional fields include `cc`, `bcc`, `reply_to`, `in_reply_to`, `references`, and `attachments` containing `filename`, `content_type` and `content_base64`. Bcc recipients appear only in the SMTP envelope.
+
+The send endpoint returns **202** with a durable job ID. Poll `GET /email/sends/{id}` for status. Reusing an idempotency key with the same request returns the existing job; different content returns **409**. `sent` means the provider accepted the submission, not that the recipient received it.
+
+Temporary rejections retry automatically. A lost acceptance response or crash during submission produces `unknown` and stops automatic retries. `POST /email/sends/{id}/retry` with `{}` retries a failed job; an unknown job requires `{"allow_duplicate":true}`. `DELETE /email/sends/{id}` cancels a pending job. See [SMTP recovery contracts](docs/operations.md#outbound-email) for limits, shutdown and provider setup.
+
 ## Run the Rust server
 
 Use the toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml); Rustup selects it automatically. Copy [epistle.example.toml](epistle.example.toml) to `epistle.toml` and configure your URLs and limits.
@@ -77,7 +108,7 @@ cargo run --locked -p epistle-server
 
 Keep `EPISTLE_AUTH__MASTER_KEY` stable across restarts and back it up separately. Replacing it makes existing encrypted credentials unreadable. The server defaults to `127.0.0.1:8080`; use a reverse proxy for public HTTPS.
 
-Application settings are grouped into `[server]`, `[storage]`, `[mail]`, `[mail.fetch]`, `[delivery]`, `[auth]`, `[auth.google]`, `[auth.microsoft]` and `[testing]`. The Rust types use the same hierarchy in `crates/core/src/config.rs`.
+Application settings are grouped into `[server]`, `[storage]`, `[mail]`, `[mail.fetch]`, `[delivery]`, `[sending]`, `[auth]`, `[auth.google]`, `[auth.microsoft]` and `[testing]`. The Rust types use the same hierarchy in `crates/core/src/config.rs`.
 
 Configuration precedence is **defaults → optional `epistle.toml` → environment** through the `config` crate. Environment names start with `EPISTLE_`, with `__` between sections: `mail.fetch.batch_count` becomes `EPISTLE_MAIL__FETCH__BATCH_COUNT`. Secrets stay strings during parsing. Existing flat file keys and unprefixed environment names remain supported; see [configuration migration](docs/operations.md#configuration-migration). SQLx migrations run automatically at startup.
 
@@ -105,6 +136,9 @@ Business endpoints, including `/health`, require `Authorization: Bearer <EPISTLE
 | Create/list accounts | `POST /email/accounts`, `GET /email/accounts` |
 | Inspect, enable/disable or remove an account | `GET`, `PATCH`, `DELETE /email/accounts/{id}` |
 | Replace credentials or start consent | `POST /email/accounts/{id}/credentials` |
+| Configure SMTP | `POST /email/accounts/{id}/smtp` |
+| Queue outbound email | `POST /email/accounts/{id}/send` |
+| List, inspect, cancel or retry sends | `GET /email/sends`, `GET` / `DELETE /email/sends/{id}`, `POST /email/sends/{id}/retry` |
 | Start, inspect or cancel a backfill | `POST /email/accounts/{id}/backfills`, `GET` / `DELETE /backfills/{id}` |
 | Read a message or download a file | `GET /email/messages/{id}`, `GET /email/messages/{id}/files/{file_id}` |
 | Set read/unread state and inspect the command | `POST /email/messages/{id}/read`, `GET /commands/{id}` |
@@ -117,7 +151,7 @@ Message files are temporary. Their retention window starts after acknowledgment;
 
 ## Shutdown, recovery and deployment
 
-SIGTERM or SIGINT stops new work and drains in-flight HTTP handlers, token exchanges, message handoffs, read commands, webhook acknowledgments and database writes. An idle IMAP worker closes promptly; it does **not** wait for another message. The instance lock is released after draining. Restart resumes persisted queues and cursors.
+SIGTERM or SIGINT stops new work and drains in-flight HTTP handlers, token exchanges, message handoffs, read commands, SMTP submissions, webhook acknowledgments and database writes. An idle IMAP worker closes promptly; it does **not** wait for another message. The instance lock is released after draining. Restart resumes persisted queues and cursors.
 
 Compose allows five minutes to stop. For a manually managed container, use `docker stop --time 300 <container>`. Allow longer when workloads require it. A forced kill or external deadline bypasses graceful shutdown and uses the documented crash-recovery paths.
 
@@ -136,6 +170,7 @@ Use `RUST_LOG=info,epistle_email=debug,epistle_auth=debug` for diagnostics. Appl
 | `auth` | Credential encryption, OAuth and token refresh |
 | `imap` | Greeting/authentication, checked commands and bounded sessions |
 | `email` | Supervision, discovery, MIME parsing, backfills and commands |
+| `send` | MIME composition, durable send jobs and shared-credential SMTP |
 | `delivery` | Durable files, retention and webhook delivery |
 | `api` | HTTP operations, OpenAPI and Scalar |
 | `server` | Startup, tracing and graceful shutdown |
@@ -161,9 +196,10 @@ docker compose build epistle
 python3 tests/token_expiry.py --image epistle-epistle:latest
 python3 tests/recovery.py --image epistle-epistle:latest
 python3 tests/shutdown.py --image epistle-epistle:latest
+python3 tests/sending.py --image epistle-epistle:latest
 ```
 
-Omit `--image` to use the host debug binary. The suites cover ingestion and files, token expiry/rotation and outages, folder isolation, and SIGTERM/SIGINT during token exchange and delivery. Rust regressions inject transaction failures and kill a child process in the refresh-token crash window.
+Omit `--image` to use the host debug binary. The suites cover ingestion and files, token expiry/rotation and outages, folder isolation, outbound SMTP submission, and SIGTERM/SIGINT during token exchange and delivery. Rust regressions inject transaction failures and kill a child process in the refresh-token crash window.
 
 CI also runs `cargo audit` and `cargo deny check`; install their Cargo subcommands to run these locally. Controlled OAuth issuers model provider contracts, including an adversarial single-use refresh token. Live Google/Microsoft policies and tenant-specific behavior still require real-account acceptance testing.
 
