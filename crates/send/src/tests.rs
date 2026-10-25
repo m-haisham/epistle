@@ -244,7 +244,10 @@ async fn mime_envelope_idempotency_and_sent_status() {
     );
     assert_eq!(parsed.body_text(0).unwrap().trim(), "Text body");
     assert!(parsed.body_html(0).unwrap().contains("HTML body"));
-    assert_eq!(parsed.attachments().next().unwrap().decoded().as_ref(), b"hello");
+    assert_eq!(
+        parsed.attachments().next().unwrap().decoded().as_ref(),
+        b"hello"
+    );
     assert!(!String::from_utf8_lossy(bytes).contains("hidden@example.test"));
     assert!(
         smtp.recipients
@@ -386,9 +389,13 @@ async fn revision_fence_disable_cancel_and_one_claim_per_account() {
         .store
         .write(|c| {
             Box::pin(async move {
-                sqlx::query("UPDATE accounts SET revision=revision+1,enabled=0 WHERE id='a'")
-                    .execute(c)
-                    .await?;
+                sqlx::query(
+                    "
+UPDATE accounts SET revision=revision+1, enabled=0 WHERE id='a'
+",
+                )
+                .execute(c)
+                .await?;
                 Ok(())
             })
         })
@@ -538,4 +545,84 @@ async fn microsoft_missing_smtp_scope_fails_without_network_submission() {
         Some("smtp_scope_missing_reauthorize")
     );
     assert!(smtp.auth.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn submission_timeout_is_unknown_and_retry_budget_stops_known_rejections() {
+    let smtp = Smtp::start().await;
+    let (_dir, mut sender) = fixture(&smtp, AuthKind::Password).await;
+    let mut config = (*sender.config).clone();
+    config.sending.timeout_secs = 1;
+    config.sending.max_attempts = 1;
+    sender.config = Arc::new(config);
+
+    smtp.mode.store(4, Ordering::SeqCst);
+    let timed_out = sender.enqueue("a", request("timeout")).await.unwrap();
+    attempt(&sender).await;
+    assert_eq!(sender.job(&timed_out.id).await.unwrap().state, "unknown");
+    smtp.release.notify_one();
+
+    smtp.mode.store(6, Ordering::SeqCst);
+    let rejected = sender.enqueue("a", request("rejected-data")).await.unwrap();
+    attempt(&sender).await;
+    let job = sender.job(&rejected.id).await.unwrap();
+    assert_eq!(job.state, "failed");
+    assert_eq!(job.last_error.as_deref(), Some("smtp_temporary_rejection"));
+    assert!(sender.claim().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn smtp_provider_defaults_and_plaintext_validation() {
+    let smtp = Smtp::start().await;
+    let (_dir, sender) = fixture(&smtp, AuthKind::Password).await;
+    let mut account = sender.store.account("a").await.unwrap();
+    let explicit = account.config.smtp.take().unwrap();
+    assert!(explicit.validate(false).is_err());
+    assert!(SmtpConfig::for_account(&account).is_none());
+
+    for kind in [AuthKind::GoogleOauth, AuthKind::GoogleServiceAccount] {
+        account.auth_kind = kind;
+        let settings = SmtpConfig::for_account(&account).unwrap();
+        assert_eq!(
+            (settings.host.as_str(), settings.port, settings.security),
+            ("smtp.gmail.com", 465, SmtpSecurity::Tls)
+        );
+    }
+
+    account.auth_kind = AuthKind::MicrosoftOauth;
+    let settings = SmtpConfig::for_account(&account).unwrap();
+    assert_eq!(
+        (settings.host.as_str(), settings.port, settings.security),
+        ("smtp.office365.com", 587, SmtpSecurity::Starttls)
+    );
+    account.config.tenant = "consumers".into();
+    assert_eq!(
+        SmtpConfig::for_account(&account).unwrap().host,
+        "smtp-mail.outlook.com"
+    );
+}
+
+#[tokio::test]
+async fn implicit_tls_never_falls_back_to_plaintext() {
+    let smtp = Smtp::start().await;
+    let (_dir, sender) = fixture(&smtp, AuthKind::Password).await;
+    let mut account = sender.store.account("a").await.unwrap();
+    account.config.smtp.as_mut().unwrap().security = SmtpSecurity::Tls;
+
+    assert!(sender.connect(&account).await.is_err());
+    assert!(smtp.auth.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn worker_storage_failure_returns_without_signalling_normal_shutdown() {
+    let smtp = Smtp::start().await;
+    let (_dir, sender) = fixture(&smtp, AuthKind::Password).await;
+    let cancel = CancellationToken::new();
+    sender.store.close().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), sender.run(cancel.clone()))
+        .await
+        .unwrap();
+    // The server observes worker completion as a fatal error, not a clean HTTP stop.
+    assert!(!cancel.is_cancelled());
 }

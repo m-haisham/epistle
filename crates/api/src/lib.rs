@@ -184,6 +184,7 @@ pub fn router(state: AppState) -> axum::Router {
             get(sending::status).delete(sending::cancel),
         )
         .api_route("/email/sends/{id}/retry", post(sending::retry))
+        .api_route("/email/sends", get(sending::list))
         .api_route("/email/messages/{id}", get(get_message))
         .api_route("/email/messages/{id}/files/{file_id}", get(download))
         .api_route("/email/messages/{id}/read", post(mark_read))
@@ -1093,6 +1094,7 @@ struct HealthResponse {
     oldest_pending_age_seconds: Option<i64>,
     dead_deliveries: i64,
     dead_fetches: i64,
+    sending: sending::SendHealth,
 }
 
 async fn health(State(s): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
@@ -1151,6 +1153,7 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
         oldest_pending_age_seconds: r.try_get::<Option<i64>, _>("oldest")?.map(|t| now() - t),
         dead_deliveries: r.try_get::<Option<i64>, _>("dead")?.unwrap_or(0),
         dead_fetches: dead_fetch,
+        sending: sending::health(&s.store).await?,
     }))
 }
 

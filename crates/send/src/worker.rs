@@ -13,17 +13,18 @@ impl Sender {
     /// Runs bounded workers; shutdown drains the current SMTP result to storage.
     pub async fn run(self, cancel: CancellationToken) {
         let mut workers = tokio::task::JoinSet::new();
+        let worker_stop = cancel.child_token();
 
         for _ in 0..self.config.sending.workers {
             let sender = self.clone();
-            let cancel = cancel.clone();
+            let cancel = worker_stop.clone();
             workers.spawn(async move { sender.work(cancel).await });
         }
 
         while let Some(result) = workers.join_next().await {
             if !matches!(result, Ok(Ok(()))) {
                 tracing::error!("send worker failed; stopping service for durable recovery");
-                cancel.cancel();
+                worker_stop.cancel();
             }
         }
 
@@ -89,7 +90,7 @@ impl Sender {
             _ => ("unknown", Some("smtp_acceptance_unknown"), 0),
         };
 
-        // A failed QUIT must never erase an already observed acceptance.
+        // Persist acceptance before closing the connection.
         self.finish(&claim.id, state, reason, next).await?;
         tracing::info!(send_id = %claim.id, account_id = %claim.account_id, state, attempt = claim.attempts, reason, "SMTP submission recorded");
 
