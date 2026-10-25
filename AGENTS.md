@@ -20,7 +20,7 @@ The adjacent `../hark` project is an incomplete reference, especially for email 
 ## Rust conventions
 
 - Use the pinned toolchain and workspace dependencies. Keep `Cargo.lock` committed; use `--locked` for reproducible checks.
-- Run rustfmt. Separate logical blocks with blank lines and expand dense closures and query chains.
+- Run rustfmt. Separate logical units with blank lines, aiming for groups of 1–5 lines where natural. Keep longer cohesive expressions intact. Extract named functions for distinct operations when that improves readability; avoid splitting solely to meet a line count. Expand dense closures and query chains.
 - Use concise `//!` module documentation and `///` documentation for public behavior. Explain invariants and non-obvious decisions without narrating the code.
 - Follow workspace lints: no unsafe code, production panics, unchecked indexing, `unwrap`, `expect` or `todo`. Keep justified test allowances scoped to tests.
 - Use typed errors and sanitized operational reason codes. Parameterize SQL and keep writes in the store's serialized transaction path.

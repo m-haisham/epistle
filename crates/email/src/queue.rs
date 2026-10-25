@@ -20,6 +20,7 @@ pub async fn enqueue(
             .bind(&identity)
             .fetch_optional(&mut *c)
             .await?;
+
     let key = existing.clone().unwrap_or_else(id);
     let pointer = serde_json::to_string(p)?;
     sqlx::query("
@@ -51,6 +52,7 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
         if handed_off > 0 {
             return Ok(false);
         }
+
         if let Some(row) = sqlx::query(
             "SELECT id,state FROM fetch_queue WHERE message_key=? ORDER BY rowid LIMIT 1",
         )
@@ -73,6 +75,7 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
 
                 return Ok(false);
             }
+
             sqlx::query(
                 "UPDATE fetch_queue SET pointer=?,origin=?,backfill_id=?,state='pending',
                  attempts=0,next_attempt_at=0,last_error=NULL WHERE id=?",
@@ -93,6 +96,7 @@ folder_id=excluded.folder_id,uidvalidity=excluded.uidvalidity,uid=excluded.uid,r
     } else {
         p.key()
     };
+
     let inserted = sqlx::query(
         "
 INSERT OR IGNORE INTO
@@ -112,6 +116,7 @@ VALUES(?,?,?,?,?,?,?,?)
     .await?
     .rows_affected()
         > 0;
+
     sqlx::query("INSERT OR IGNORE INTO seen(account_id,message_id_hash,message_key,first_seen_at) VALUES(?,?,?,?)")
         .bind(&p.account_id)
         .bind(identity)
@@ -133,6 +138,7 @@ pub async fn handoff(store: &Store, stub: String, prepared: Prepared) -> Result<
                         .bind(&stub)
                         .fetch_optional(&mut *c)
                         .await?;
+
                 let Some(row) = row else { return Ok(()) };
                 let key = &prepared.message.id;
                 let account = &prepared.message.account_id;
@@ -148,11 +154,13 @@ CONFLICT(id) DO UPDATE SET payload_path=excluded.payload_path,expired=0,expires_
                 .bind(now())
                 .execute(&mut *c)
                 .await?;
+
                 sqlx::query("INSERT INTO message_payloads(path,message_key) VALUES(?,?)")
                     .bind(&prepared.payload_path)
                     .bind(key)
                     .execute(&mut *c)
                     .await?;
+
                 sqlx::query(
                     "UPDATE message_payloads SET expires_at=NULL WHERE message_key=? AND expired=0",
                 )
@@ -181,12 +189,14 @@ VALUES(?,?,?,?,?,?,?,?,?)
                     .execute(&mut *c)
                     .await?;
                 }
+
                 sqlx::query(
                     "UPDATE message_files SET expires_at=NULL WHERE message_key=? AND expired=0",
                 )
                 .bind(key)
                 .execute(&mut *c)
                 .await?;
+
                 sqlx::query(
                     "
 INSERT OR IGNORE INTO
@@ -203,6 +213,7 @@ VALUES(?,?,?,'email.message.received',?,?,?,?)
                 .bind(now())
                 .execute(&mut *c)
                 .await?;
+
                 sqlx::query("DELETE FROM fetch_queue WHERE id=?")
                     .bind(stub)
                     .execute(c)

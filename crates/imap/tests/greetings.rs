@@ -53,29 +53,39 @@ async fn gmail_exchange_and_dovecot_greetings_precede_password_and_xoauth2() {
                 );
                 // Also exercise a fragmented greeting.
                 let (head, tail) = banner.as_bytes().split_at_checked(5).unwrap();
+
                 socket.write_all(head).await.unwrap();
                 tokio::task::yield_now().await;
                 socket.write_all(tail).await.unwrap();
+
                 let mut io = BufReader::new(socket);
                 let mut line = String::new();
                 io.read_line(&mut line).await.unwrap();
+
                 let tag = line.split_whitespace().next().unwrap().to_string();
+
                 if password {
                     assert!(line.contains(" LOGIN "));
                 } else {
                     assert!(line.contains(" AUTHENTICATE XOAUTH2"));
+
                     io.get_mut().write_all(b"+ \r\n").await.unwrap();
                     line.clear();
                     io.read_line(&mut line).await.unwrap();
+
                     assert!(!line.trim().is_empty());
                 }
+
                 io.get_mut()
                     .write_all(format!("{tag} OK authenticated\r\n").as_bytes())
                     .await
                     .unwrap();
                 line.clear();
+
                 io.read_line(&mut line).await.unwrap();
+
                 assert!(line.contains(" CAPABILITY"));
+
                 let tag = line.split_whitespace().next().unwrap();
                 io.get_mut()
                     .write_all(
@@ -84,19 +94,25 @@ async fn gmail_exchange_and_dovecot_greetings_precede_password_and_xoauth2() {
                     )
                     .await
                     .unwrap();
+
                 line.clear();
                 io.read_line(&mut line).await.unwrap();
+
                 assert!(line.contains(" LOGOUT"));
+
                 let tag = line.split_whitespace().next().unwrap();
                 io.get_mut()
                     .write_all(format!("* BYE logout\r\n{tag} OK logout\r\n").as_bytes())
                     .await
                     .unwrap();
             });
+
             let conn = Connection::connect(&a, "test-secret".into(), password, 2)
                 .await
                 .unwrap();
+
             assert!(conn.idle_supported);
+
             conn.logout().await;
             server.await.unwrap();
         }
@@ -118,20 +134,24 @@ async fn rejecting_or_unsupported_greeting_never_receives_credentials() {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(banner.as_bytes()).await.unwrap();
+
             let mut received = Vec::new();
             timeout(Duration::from_secs(2), socket.read_to_end(&mut received))
                 .await
                 .unwrap()
                 .unwrap();
+
             assert!(received.is_empty());
         });
         let error = Connection::connect(&a, "test-secret".into(), false, 2)
             .await
             .err()
             .unwrap();
+
         assert_eq!(error.reason, reason);
         assert!(!error.auth);
         assert!(!error.to_string().contains("test-secret"));
+
         server.await.unwrap();
     }
 }
@@ -144,8 +164,10 @@ async fn missing_greeting_is_bounded_by_watchdog() {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut received = Vec::new();
         socket.read_to_end(&mut received).await.unwrap();
+
         assert!(received.is_empty());
     });
+
     assert!(
         timeout(
             Duration::from_secs(2),
@@ -155,6 +177,7 @@ async fn missing_greeting_is_bounded_by_watchdog() {
         .unwrap()
         .is_err()
     );
+
     server.await.unwrap();
 }
 
@@ -165,21 +188,26 @@ async fn login_outage_is_not_misclassified_as_revoked_credentials() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"* OK ready\r\n").await.unwrap();
+
         let mut io = BufReader::new(socket);
         let mut line = String::new();
         io.read_line(&mut line).await.unwrap();
+
         let tag = line.split_whitespace().next().unwrap();
         io.get_mut()
             .write_all(format!("{tag} NO [UNAVAILABLE] maintenance\r\n").as_bytes())
             .await
             .unwrap();
     });
+
     let error = Connection::connect(&a, "secret".into(), true, 2)
         .await
         .err()
         .unwrap();
+
     assert_eq!(error.reason, "provider_outage");
     assert!(!error.auth && !error.permanent);
+
     server.await.unwrap();
 }
 
@@ -190,12 +218,16 @@ async fn epoch_fallback_checks_exact_message_id_before_store() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"* OK ready\r\n").await.unwrap();
+
         let mut io = BufReader::new(socket);
+
         loop {
             let mut line = String::new();
+
             if io.read_line(&mut line).await.unwrap() == 0 {
                 break;
             }
+
             let tag = line.split_whitespace().next().unwrap();
             let data = if line.contains(" CAPABILITY") {
                 "* CAPABILITY IMAP4rev1\r\n"
@@ -217,12 +249,14 @@ async fn epoch_fallback_checks_exact_message_id_before_store() {
                 assert!(line.contains(" LOGIN ") || line.contains(" LOGOUT"));
                 ""
             };
+
             io.get_mut()
                 .write_all(format!("{data}{tag} OK done\r\n").as_bytes())
                 .await
                 .unwrap();
         }
     });
+
     let mut conn = Connection::connect(&a, "secret".into(), true, 2)
         .await
         .unwrap();
@@ -240,8 +274,11 @@ async fn epoch_fallback_checks_exact_message_id_before_store() {
         size: 1,
         internal_date: 0,
     };
+
     let resolved = conn.mark_read(&pointer, true).await.unwrap().unwrap();
+
     assert_eq!((resolved.uidvalidity, resolved.uid), (2, 8));
+
     drop(conn);
     server.await.unwrap();
 }
@@ -255,12 +292,16 @@ async fn rejected_commands_never_expose_partial_results_or_success() {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 socket.write_all(b"* OK ready\r\n").await.unwrap();
+
                 let mut io = BufReader::new(socket);
+
                 loop {
                     let mut line = String::new();
+
                     if io.read_line(&mut line).await.unwrap() == 0 {
                         break;
                     }
+
                     let tag = line.split_whitespace().next().unwrap();
                     let command = line.split_once(' ').unwrap().1;
                     let partial = if command.starts_with("CAPABILITY") {
@@ -276,11 +317,13 @@ async fn rejected_commands_never_expose_partial_results_or_success() {
                     } else {
                         ""
                     };
+
                     let completion = if command.starts_with(rejected) {
                         status
                     } else {
                         "OK"
                     };
+
                     io.get_mut()
                         .write_all(
                             format!("{partial}{tag} {completion} [UNAVAILABLE] test failure\r\n")
@@ -290,7 +333,9 @@ async fn rejected_commands_never_expose_partial_results_or_success() {
                         .unwrap();
                 }
             });
+
             let connection = Connection::connect(&a, "secret".into(), true, 2).await;
+
             if rejected == "CAPABILITY" {
                 assert_eq!(connection.err().unwrap().reason, "provider_outage");
             } else {
@@ -314,16 +359,20 @@ async fn rejected_commands_never_expose_partial_results_or_success() {
                             size: 1,
                             internal_date: 0,
                         };
+
                         conn.mark_read(&pointer, true).await.err()
                     }
+
                     _ => unreachable!(),
                 };
+
                 assert_eq!(
                     error.unwrap().reason,
                     "provider_outage",
                     "{rejected} {status}"
                 );
             }
+
             server.await.unwrap();
         }
     }
@@ -336,12 +385,16 @@ async fn metadata_ignores_unsolicited_uids_and_flag_only_updates() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"* OK ready\r\n").await.unwrap();
+
         let mut io = BufReader::new(socket);
+
         loop {
             let mut line = String::new();
+
             if io.read_line(&mut line).await.unwrap() == 0 {
                 break;
             }
+
             let tag = line.split_whitespace().next().unwrap();
             let data = if line.contains(" CAPABILITY") {
                 "* CAPABILITY IMAP4rev1\r\n"
@@ -350,24 +403,31 @@ async fn metadata_ignores_unsolicited_uids_and_flag_only_updates() {
             } else {
                 ""
             };
+
             io.get_mut()
                 .write_all(format!("{data}{tag} OK done\r\n").as_bytes())
                 .await
                 .unwrap();
         }
     });
+
     let mut conn = Connection::connect(&a, "secret".into(), true, 2)
         .await
         .unwrap();
     let records = conn.metadata(&a, "f", "INBOX", 1, "1").await.unwrap();
+
     assert_eq!(records.len(), 1);
+
     let record = records.first().unwrap();
+
     assert_eq!(record.uid, 1);
     assert_eq!(
         record.rfc_message_id.as_deref(),
         Some("<target@example.test>")
     );
+
     assert_eq!(record.flags, ["\\Seen"]);
+
     drop(conn);
     server.await.unwrap();
 }

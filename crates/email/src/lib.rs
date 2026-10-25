@@ -75,9 +75,11 @@ impl Service {
                     Err(e) if e.auth => {
                         Err(epistle_auth::Error::Reauth("credentials_rejected").into())
                     }
+
                     Err(e) => Err(e.into()),
                 }
             }
+
             Err(e) => Err(e.into()),
         }
     }
@@ -101,6 +103,7 @@ impl Service {
                     continue;
                 }
             };
+
             let mut remove = vec![];
 
             for (id, (revision, _, task)) in &accounts {
@@ -121,6 +124,7 @@ impl Service {
 
                     if task.await.is_err() {
                         panicked.insert(id.clone());
+
                         let _ = self
                             .store
                             .status_for_revision(&id, revision, "error", Some("worker_panicked"), 0)
@@ -128,6 +132,7 @@ impl Service {
                     }
                 }
             }
+
             for a in all {
                 if cancel.is_cancelled() {
                     break;
@@ -148,6 +153,7 @@ impl Service {
                 let account = a.clone();
                 let span =
                     tracing::info_span!("account", account_id = %a.id, revision = a.revision);
+
                 let task = tokio::spawn(
                     async move {
                         if account.status == "needs_reauth" {
@@ -158,13 +164,17 @@ impl Service {
                     }
                     .instrument(span),
                 );
+
                 accounts.insert(a.id, (a.revision, stop, task));
             }
         }
+
         for (_, (_, stop, task)) in accounts {
             stop.cancel();
+
             let _ = task.await;
         }
+
         tracing::info!("account workers stopped");
     }
 
@@ -175,6 +185,7 @@ impl Service {
             if result.is_err() {
                 stop.cancel();
             }
+
             result
         };
         let (watch, fetch, commands) = tokio::join!(
@@ -204,6 +215,7 @@ impl Service {
         .flatten()
         .flatten()
         .unwrap_or(0);
+
         let _ = self
             .store
             .status_for_revision(&a.id, a.revision, "connecting", None, failures)
@@ -224,6 +236,7 @@ impl Service {
 
             if matches!(error, Error::Recycle) {
                 failures = 0;
+
                 let _ = self
                     .store
                     .status_for_revision(
@@ -234,8 +247,10 @@ impl Service {
                         0,
                     )
                     .await;
+
                 continue;
             }
+
             if self
                 .store
                 .account(&a.id)
@@ -256,13 +271,16 @@ impl Service {
                 Error::Auth(epistle_auth::Error::Unconfigured | epistle_auth::Error::Data) => {
                     ("error", "invalid_configuration", true)
                 }
+
                 Error::Auth(epistle_auth::Error::Crypto) => {
                     ("error", "credential_decryption_failed", true)
                 }
+
                 Error::Join(_) => ("error", "worker_panicked", true),
                 Error::Imap(e) if e.auth && failures >= 3 && now() - first_failure >= 120 => {
                     ("needs_reauth", e.reason, true)
                 }
+
                 Error::Imap(e) if e.permanent => ("error", e.reason, true),
                 Error::Imap(e) => ("degraded", e.reason, false),
                 Error::Auth(_) => ("degraded", "provider_outage", false),
@@ -287,12 +305,14 @@ impl Service {
                 .status_for_revision(&a.id, a.revision, status, Some(reason), failures)
                 .await;
             let _ = self.store.worker_state(&a.id, "backoff").await;
+
             tracing::warn!(account_id = %a.id, reason, failures, "account connection interrupted");
 
             if permanent {
                 if status == "needs_reauth" && self.config.auth.reauth_reminder_secs > 0 {
                     self.remind(&a, &cancel).await;
                 }
+
                 return;
             }
 
@@ -301,6 +321,7 @@ impl Service {
             } else {
                 backoff(failures)
             };
+
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
@@ -313,6 +334,7 @@ impl Service {
         if self.config.auth.reauth_reminder_secs <= 0 {
             return;
         }
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,

@@ -15,6 +15,7 @@ impl Service {
         }
 
         self.store.worker_state(&a.id, "authenticating").await?;
+
         let (mut conn, recycle_at) = self.connect(a).await?;
         let names = conn.folders(a).await?;
         self.store.worker_state(&a.id, "syncing").await?;
@@ -62,17 +63,21 @@ impl Service {
                             })
                             .await?;
                         selected = false;
+
                         continue;
                     }
+
                     Err(e) => return Err(e.into()),
                 };
                 healthy_folder = Some(name);
                 selected = true;
+
                 let validity = i64::from(mailbox.uid_validity.ok_or(epistle_imap::Error {
                     reason: "uidvalidity_missing",
                     permanent: true,
                     auth: false,
                 })?);
+
                 let next = i64::from(mailbox.uid_next.unwrap_or(1));
                 let existing = sqlx::query(
                     "SELECT id,uidvalidity,cursor_uid FROM folders WHERE account_id=? AND name=?",
@@ -81,6 +86,7 @@ impl Service {
                 .bind(name)
                 .fetch_optional(&self.store.reads)
                 .await?;
+
                 let (fid, cursor, initial) = if let Some(row) = existing {
                     let fid: String = row.try_get("id")?;
                     let initial = row.try_get::<i64, _>("uidvalidity")? == 0;
@@ -95,11 +101,13 @@ impl Service {
                 } else {
                     (id(), next.saturating_sub(1), false)
                 };
+
                 let f = fid.clone();
                 let account = a.id.clone();
                 let n = name.clone();
                 let days = a.config.initial_sync_days;
                 let modseq = mailbox.highest_modseq.and_then(|x| i64::try_from(x).ok());
+
                 self.store
                     .write(move |c| {
                         Box::pin(async move {
@@ -118,6 +126,7 @@ VALUES(?,?,?,?,?,?,?)
                                 .execute(&mut *c)
                                 .await?
                                 .rows_affected();
+
                             sqlx::query("UPDATE folders SET uidvalidity=?,uidnext=?,cursor_uid=?,highestmodseq=?,state='idle',last_error=NULL,last_synced_at=? WHERE id=?")
                                 .bind(validity)
                                 .bind(next)
@@ -144,6 +153,7 @@ VALUES(?,?,?,?,?,?,?)
                         })
                     })
                     .await?;
+
                 let ids = conn
                     .search(&format!("UID {}:*", cursor.saturating_add(1)))
                     .await?;
@@ -174,6 +184,7 @@ VALUES(?,?,?,?,?,?,?)
                                 for p in items {
                                     enqueue(c, &p, "live", None, false).await?;
                                 }
+
                                 sqlx::query("UPDATE folders SET cursor_uid=MAX(cursor_uid,?),last_synced_at=?,state='idle' WHERE id=?")
                                     .bind(max)
                                     .bind(now())
@@ -187,6 +198,7 @@ VALUES(?,?,?,?,?,?,?)
                         .await?;
                 }
             }
+
             if let Some(name) = healthy_folder {
                 // A failed EXAMINE may deselect the previous mailbox.
                 if !selected {
@@ -196,6 +208,7 @@ VALUES(?,?,?,?,?,?,?)
                 self.store
                     .status_for_revision(&a.id, a.revision, "active", None, 0)
                     .await?;
+
                 let account = a.id.clone();
                 self.store
                     .write(move |c| {
@@ -238,6 +251,7 @@ VALUES(?,?,?,?,?,?,?)
 
                         return Ok(());
                     }
+
                     _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
                 }
             }
@@ -265,6 +279,7 @@ VALUES(?,?,?,?,?,?,?)
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(300)) => {}
             }
+
             if !self.active(a).await? {
                 continue;
             }
@@ -296,6 +311,7 @@ ORDER BY created_at,id LIMIT ?
                 self.finish_backfills(a).await?;
                 continue;
             }
+
             if connection
                 .as_ref()
                 .is_none_or(|(_, recycle_at)| *recycle_at <= now())
@@ -307,6 +323,7 @@ ORDER BY created_at,id LIMIT ?
                 if let Some((c, _)) = connection.take() {
                     c.logout().await;
                 }
+
                 connection = Some(self.connect(a).await?);
             }
 
@@ -332,6 +349,7 @@ ORDER BY created_at,id LIMIT ?
                     break;
                 }
                 bytes += p.size;
+
                 let stub: String = row.try_get("id")?;
                 let fetch = conn.fetch(&p).await;
                 let fetched = match fetch {
@@ -368,6 +386,7 @@ ORDER BY created_at,id LIMIT ?
                     let job: Option<String> = row.try_get("backfill_id")?;
                     let cap = self.config.mail.inline_body_cap;
                     let p = resolved.clone();
+
                     let parsed = tokio::task::spawn_blocking(move || {
                         parse_message(mid, &p, raw, origin, job, cap)
                     })
@@ -395,6 +414,7 @@ ORDER BY created_at,id LIMIT ?
                         })
                         .await?;
                 }
+
                 last_work = Instant::now();
             }
 
@@ -424,11 +444,13 @@ BY created_at LIMIT 1
         .fetch_optional(&self.store.reads)
         .await?;
         let Some(row) = row else { return Ok(()) };
+
         let job: String = row.try_get("id")?;
         let since: i64 = row.try_get("since")?;
         let until: Option<i64> = row.try_get("until")?;
         let unread: bool = row.try_get("unread_only")?;
         let redeliver: bool = row.try_get("redeliver")?;
+
         let requested: Option<Vec<String>> = row
             .try_get::<Option<String>, _>("folders_json")?
             .map(|s| serde_json::from_str(&s))
@@ -463,13 +485,16 @@ BY created_at LIMIT 1
 
                     return Ok(());
                 }
+
                 Err(e) => return Err(e.into()),
             };
+
             let validity = i64::from(mailbox.uid_validity.ok_or(epistle_imap::Error {
                 reason: "uidvalidity_missing",
                 permanent: true,
                 auth: false,
             })?);
+
             let fid = sqlx::query_scalar::<_, String>(
                 "SELECT id FROM folders WHERE account_id=? AND name=?",
             )
@@ -478,6 +503,7 @@ BY created_at LIMIT 1
             .fetch_optional(&self.store.reads)
             .await?
             .unwrap_or_else(id);
+
             let f = fid.clone();
             let account = a.id.clone();
             let n = name.clone();
@@ -496,6 +522,7 @@ BY created_at LIMIT 1
                     })
                 })
                 .await?;
+
             let done: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM backfill_folders WHERE job_id=? AND folder_id=?",
             )
@@ -559,6 +586,7 @@ BY created_at LIMIT 1
                                     .execute(&mut *c)
                                     .await?
                                     .rows_affected();
+
                                 sqlx::query("UPDATE backfill_jobs SET matched=matched+?,state='scanning' WHERE id=? AND state!='cancelled'")
                                     .bind(inserted as i64)
                                     .bind(&j)
@@ -587,6 +615,7 @@ BY created_at LIMIT 1
                 })
                 .await?;
         }
+
         loop {
             if cancel.is_cancelled() {
                 return Ok(());
@@ -614,6 +643,7 @@ BY created_at LIMIT 1
                         if state.as_deref() == Some("cancelled") || state.is_none() {
                             return Ok(());
                         }
+
                         for row in matches {
                             let p: Pointer =
                                 serde_json::from_str(&row.try_get::<String, _>("pointer")?)?;
@@ -638,6 +668,7 @@ BY created_at LIMIT 1
                     })
                 })
                 .await?;
+
             let state: Option<String> =
                 sqlx::query_scalar("SELECT state FROM backfill_jobs WHERE id=?")
                     .bind(&job)
@@ -701,6 +732,7 @@ EXISTS(SELECT 1 FROM outbox WHERE backfill_id=backfill_jobs.id)
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(300)) => {}
             }
+
             if !self.active(a).await? {
                 continue;
             }
@@ -739,6 +771,7 @@ prior.state='pending' AND prior.rowid<cmd.rowid) ORDER BY rowid LIMIT 50
                         .bind(&mid)
                         .fetch_optional(&self.store.reads)
                         .await?;
+
                 let original_pointer = pointer.clone();
                 let outcome = if let Some(pointer) = pointer {
                     let p: Pointer = serde_json::from_str(&pointer)?;
@@ -763,6 +796,7 @@ prior.state='pending' AND prior.rowid<cmd.rowid) ORDER BY rowid LIMIT 50
                                     if current != original_pointer {
                                         return Ok(());
                                     }
+
                                     sqlx::query(
                                         "UPDATE commands SET state=?,completed_at=? WHERE id=?",
                                     )
@@ -787,6 +821,7 @@ prior.state='pending' AND prior.rowid<cmd.rowid) ORDER BY rowid LIMIT 50
                             })
                             .await?;
                     }
+
                     Err(e) => {
                         if e.reason != "invalid_message_id" {
                             return Err(e.into());
@@ -811,6 +846,7 @@ prior.state='pending' AND prior.rowid<cmd.rowid) ORDER BY rowid LIMIT 50
                     }
                 }
             }
+
             conn.logout().await;
         }
 

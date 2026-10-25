@@ -36,6 +36,7 @@ pub enum Error {
     #[error("invalid or expired OAuth state")]
     State,
 }
+
 // Intentionally no Debug: credentials must never appear in traces.
 /// Secret provider credentials encrypted before persistence.
 #[derive(Default, Clone, Serialize, Deserialize, Zeroize)]
@@ -93,6 +94,7 @@ impl Vault {
                 },
             )
             .map_err(|_| Error::Crypto)?;
+
         let master = ChaCha20Poly1305::new_from_slice(self.master.as_ref().as_ref())
             .map_err(|_| Error::Crypto)?;
         let wrapped_key = master
@@ -104,6 +106,7 @@ impl Vault {
                 },
             )
             .map_err(|_| Error::Crypto)?;
+
         serde_json::to_string(&Envelope {
             key_id: "env-v1".into(),
             wrapped_key,
@@ -130,6 +133,7 @@ impl Vault {
                 )
                 .map_err(|_| Error::Crypto)?,
         );
+
         let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| Error::Crypto)?;
 
         Ok(Zeroizing::new(
@@ -186,6 +190,7 @@ impl Credentials {
         let margin = self.access_issued_at.map_or(300, |issued| {
             (expiry.saturating_sub(issued) / 10).clamp(1, 300)
         });
+
         expiry.saturating_sub(margin)
     }
 }
@@ -239,6 +244,7 @@ impl TokenProvider {
                 .bind(a)
                 .fetch_optional(&self.store.reads)
                 .await?;
+
         let bytes = self
             .vault
             .open(a, &sealed.ok_or(Error::Reauth("credentials_rejected"))?)?;
@@ -261,6 +267,7 @@ impl TokenProvider {
         let exp = c.access_expires_at;
         let refresh_exp = c.refresh_token_expires_at;
         let scopes = serde_json::to_string(&c.scopes).map_err(|_| Error::Data)?;
+
         self.store
             .write(move |db| {
                 Box::pin(async move {
@@ -304,6 +311,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 password: true,
             });
         }
+
         if !force
             && c.refresh_at() > now()
             && let Some(token) = &c.access_token
@@ -315,6 +323,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 password: false,
             });
         }
+
         if a.auth_kind.oauth()
             && c.refresh_token_expires_at
                 .is_some_and(|expiry| expiry <= now())
@@ -342,6 +351,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 iat: now(),
                 exp: now() + 3600,
             };
+
             let key = jsonwebtoken::EncodingKey::from_rsa_pem(
                 c.private_key.as_deref().ok_or(Error::Data)?.as_bytes(),
             )
@@ -352,6 +362,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 &key,
             )
             .map_err(|_| Error::Data)?;
+
             vec![
                 (
                     "grant_type",
@@ -373,6 +384,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 ("client_secret", secret),
             ]
         };
+
         tracing::debug!("requesting access token");
 
         let response = self.exchange(&endpoint, &form).await?;
@@ -450,11 +462,13 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
             .send()
             .await
             .map_err(|_| Error::Temporary)?;
+
         let status = response.status();
 
         if status.is_server_error() || status.as_u16() == 429 {
             return Err(Error::Temporary);
         }
+
         if !status.is_success() {
             let body: serde_json::Value = response.json().await.map_err(|_| Error::Temporary)?;
 
@@ -463,6 +477,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                 Some("interaction_required" | "consent_required") => {
                     Error::Reauth("consent_required")
                 }
+
                 Some("invalid_scope") => Error::Reauth("scope_missing"),
                 _ => Error::Reauth("credentials_rejected"),
             });
@@ -484,6 +499,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         if r.access_token.is_empty() {
             return Err(Error::Data);
         }
+
         if let Some(scope) = r.scope {
             c.scopes = scope.split_whitespace().map(str::to_owned).collect();
         }
@@ -499,7 +515,9 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
         {
             return Err(Error::Reauth("scope_missing"));
         }
+
         c.access_token = Some(r.access_token);
+
         let issued = now();
         c.access_issued_at = Some(issued);
         c.access_expires_at = Some(issued + r.expires_in.unwrap_or(3600).clamp(1, 86400));
@@ -515,6 +533,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
             // (including rotation) must never silently extend a known deadline.
             c.refresh_token_expires_at = None;
         }
+
         if let Some(token) = r.refresh_token {
             c.refresh_token = Some(token);
         }
@@ -531,17 +550,21 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
             self.config.delivery.webhook_secret.as_bytes(),
         )
         .map_err(|_| Error::Crypto)?;
+
         mac.update(unsigned.as_bytes());
+
         let state = format!(
             "{unsigned}.{}",
             URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
         );
+
         let verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let encrypted = self.vault.seal(&a.id, verifier.as_bytes())?;
         let state_hash = hash(state.as_bytes());
         let account = a.id.clone();
         let revision = a.revision;
+
         self.store
             .write(move |c| {
                 Box::pin(async move {
@@ -550,6 +573,7 @@ ciphertext=excluded.ciphertext,access_expires_at=excluded.access_expires_at,refr
                         .bind(now())
                         .execute(&mut *c)
                         .await?;
+
                     sqlx::query(
                         "
 INSERT INTO oauth_states(state_hash,account_id,encrypted_verifier,expires_at,revision)
@@ -568,6 +592,7 @@ VALUES(?,?,?,?,?)
                 })
             })
             .await?;
+
         let base = if a.auth_kind == AuthKind::MicrosoftOauth {
             format!(
                 "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
@@ -576,12 +601,14 @@ VALUES(?,?,?,?,?)
         } else {
             "https://accounts.google.com/o/oauth2/v2/auth".into()
         };
+
         let mut url = url::Url::parse(&base).map_err(|_| Error::Data)?;
         let scope = if a.auth_kind == AuthKind::MicrosoftOauth {
             "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
         } else {
             "https://mail.google.com/"
         };
+
         url.query_pairs_mut().extend_pairs([
             ("client_id", client.as_str()),
             (
@@ -612,6 +639,7 @@ VALUES(?,?,?,?,?)
             self.config.delivery.webhook_secret.as_bytes(),
         )
         .map_err(|_| Error::Crypto)?;
+
         mac.update(unsigned.as_bytes());
         mac.verify_slice(
             &URL_SAFE_NO_PAD
@@ -619,6 +647,7 @@ VALUES(?,?,?,?,?)
                 .map_err(|_| Error::State)?,
         )
         .map_err(|_| Error::State)?;
+
         let state_hash = hash(state.as_bytes());
         let row = self
             .store
@@ -638,6 +667,7 @@ account_id,encrypted_verifier,revision
             })
             .await?
             .ok_or(Error::State)?;
+
         let account_id: String = row.try_get("account_id")?;
         let _guard = self.lock(&account_id).await;
         let a = self.store.account(&account_id).await?;
@@ -667,9 +697,11 @@ account_id,encrypted_verifier,revision
                 String::from_utf8(verifier.to_vec()).map_err(|_| Error::Data)?,
             ),
         ];
+
         let r = self.exchange(&self.endpoint(&a), &form).await?;
         let mut c = self.load(&a.id).await?;
         self.apply_response(&a, &mut c, r, true)?;
+
         // Credentials and activation must commit together. Otherwise a crash can
         // leave a successfully authorized account parked in needs_reauth forever.
         let sealed = self.encrypt_credentials(&a.id, &c)?;
@@ -678,6 +710,7 @@ account_id,encrypted_verifier,revision
         let scopes = serde_json::to_string(&c.scopes).map_err(|_| Error::Data)?;
         let id = a.id.clone();
         let revision = a.revision;
+
         self.store
             .write(move |db| {
                 Box::pin(async move {
@@ -690,6 +723,7 @@ account_id,encrypted_verifier,revision
                     if current != Some(revision) {
                         return Err(epistle_store::Error::Conflict("stale_oauth_callback"));
                     }
+
                     sqlx::query("UPDATE credentials SET ciphertext=?,access_expires_at=?,refresh_expires_at=?,scopes=?,updated_at=? WHERE account_id=?")
                         .bind(sealed)
                         .bind(access_exp)
@@ -699,6 +733,7 @@ account_id,encrypted_verifier,revision
                         .bind(&id)
                         .execute(&mut *db)
                         .await?;
+
                     sqlx::query("UPDATE accounts SET revision=revision+1,enabled=1 WHERE id=?")
                         .bind(&id)
                         .execute(&mut *db)
@@ -735,7 +770,9 @@ mod tests {
             access_expires_at: Some(1012),
             ..Default::default()
         };
+
         assert_eq!(c.refresh_at(), 1011);
+
         let access = Access {
             secret: "test".into(),
             expires_at: 1012,
@@ -746,9 +783,13 @@ mod tests {
         for id in ["a", "z", "0"] {
             assert_eq!(access.recycle_at(id), 1011);
         }
+
         c.access_expires_at = Some(4600);
+
         assert_eq!(c.refresh_at(), 4300);
+
         c.access_issued_at = None;
+
         assert_eq!(c.refresh_at(), 4300);
     }
 
@@ -756,11 +797,13 @@ mod tests {
     fn envelope_encryption_binds_account_and_detects_tampering() {
         let vault = Vault::new(&"01".repeat(32)).unwrap();
         let sealed = vault.seal("account-a", b"refresh-token-secret").unwrap();
+
         assert!(!sealed.contains("refresh-token-secret"));
         assert_eq!(
             &**vault.open("account-a", &sealed).unwrap(),
             b"refresh-token-secret"
         );
+
         assert!(vault.open("account-b", &sealed).is_err());
         assert!(
             Vault::new(&"02".repeat(32))
@@ -768,8 +811,10 @@ mod tests {
                 .open("account-a", &sealed)
                 .is_err()
         );
+
         let mut value: serde_json::Value = serde_json::from_str(&sealed).unwrap();
         value["ciphertext"] = serde_json::json!([0, 1, 2]);
+
         assert!(vault.open("account-a", &value.to_string()).is_err());
         assert_ne!(
             sealed,

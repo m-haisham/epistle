@@ -55,10 +55,12 @@ pub async fn account(
             Box::pin(async move {
                 sqlx::query("INSERT INTO accounts(id,external_ref,auth_kind,email,config,status_since,created_at) VALUES('a','ref',?,'a@example.test','{}',0,0)")
                     .bind(encoded).execute(c).await?;
+
                 Ok(())
             })
         })
         .await
         .unwrap();
+
     store.account("a").await.unwrap()
 }

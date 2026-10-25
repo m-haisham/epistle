@@ -16,8 +16,10 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
     let mut account = support::account(&store, AuthKind::Password).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     account.config.host = "127.0.0.1".into();
+
     account.config.port = listener.local_addr().unwrap().port();
     account.config.tls = false;
+
     let failing = Arc::new(AtomicBool::new(true));
     let fail = failing.clone();
     let server = tokio::spawn(async move {
@@ -26,6 +28,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
             let fail = fail.clone();
             tokio::spawn(async move {
                 socket.write_all(b"* OK ready\r\n").await.unwrap();
+
                 let mut io = BufReader::new(socket);
 
                 loop {
@@ -66,6 +69,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
             });
         }
     });
+
     let pointer = Pointer {
         account_id: "a".into(),
         folder_id: "f".into(),
@@ -80,6 +84,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
         size: 1,
         internal_date: now(),
     };
+
     store
         .write(move |c| {
             Box::pin(async move {
@@ -91,6 +96,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
         })
         .await
         .unwrap();
+
     let config = Arc::new(support::config(dir.path()));
     let tokens = TokenProvider::new(store.clone(), config.clone()).unwrap();
     tokens
@@ -103,6 +109,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
         )
         .await
         .unwrap();
+
     let service = Service {
         store: store.clone(),
         tokens,
@@ -122,6 +129,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
             .unwrap(),
             Err(Error::Imap(_))
         ));
+
         assert!(matches!(
             tokio::time::timeout(
                 Duration::from_secs(3),
@@ -132,16 +140,19 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
             Err(Error::Imap(_))
         ));
     }
+
     for query in [
         "SELECT state,attempts,next_attempt_at FROM fetch_queue",
         "SELECT state,attempts,next_attempt_at FROM commands",
     ] {
         let (state, attempts, next): (String, i64, i64) =
             sqlx::query_as(query).fetch_one(&store.reads).await.unwrap();
+
         assert_eq!((state, attempts, next), ("pending".into(), 0, 0));
     }
     // A fresh writer epoch resumes the very same queued work after the outage.
     drop(service);
+
     let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
     let service = Service {
         tokens: TokenProvider::new(store.clone(), config.clone()).unwrap(),
@@ -149,7 +160,9 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
         files: FileStore::new(dir.path()),
         config,
     };
+
     failing.store(false, Ordering::SeqCst);
+
     let worker = service.clone();
     let a = account.clone();
     let fetch =
@@ -159,6 +172,7 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
             .command_worker(&account, &CancellationToken::new())
             .await
     });
+
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fetch_queue")
@@ -173,17 +187,21 @@ async fn repeated_provider_outages_preserve_fetches_and_commands_until_restart_r
             if pending == 0 && state == "done" {
                 break;
             }
+
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
+
     let messages: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE kind='email.message.received'")
             .fetch_one(&store.reads)
             .await
             .unwrap();
+
     assert_eq!(messages, 1);
+
     fetch.abort();
     command.abort();
     server.abort();
@@ -198,10 +216,13 @@ async fn restart_resumes_opt_in_reauth_reminders_without_reconnecting() {
         .status("a", "needs_reauth", Some("token_revoked"), 3)
         .await
         .unwrap();
+
     drop(store);
+
     let store = Store::open(&dir.path().join("db.sqlite")).await.unwrap();
     let mut config = support::config(dir.path());
     config.auth.reauth_reminder_secs = 1;
+
     let config = Arc::new(config);
     let service = Service {
         tokens: TokenProvider::new(store.clone(), config.clone()).unwrap(),
@@ -209,11 +230,13 @@ async fn restart_resumes_opt_in_reauth_reminders_without_reconnecting() {
         files: FileStore::new(dir.path()),
         config,
     };
+
     let stop = CancellationToken::new();
     let task = tokio::spawn(service.run(stop.clone()));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let account = store.account("a").await.unwrap();
+
             assert_eq!(account.status, "needs_reauth");
             assert_eq!(account.status_reason.as_deref(), Some("token_revoked"));
 
@@ -221,11 +244,13 @@ async fn restart_resumes_opt_in_reauth_reminders_without_reconnecting() {
                 assert_eq!(account.consecutive_failures, 4);
                 break;
             }
+
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
+
     stop.cancel();
     task.await.unwrap();
 }
@@ -239,6 +264,7 @@ async fn restart_keeps_password_failure_count_and_elapsed_window() {
         .status("a", "degraded", Some("credentials_rejected"), 3)
         .await
         .unwrap();
+
     store
         .write(|c| {
             Box::pin(async move {
@@ -252,23 +278,28 @@ async fn restart_keeps_password_failure_count_and_elapsed_window() {
         })
         .await
         .unwrap();
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut a = store.account("a").await.unwrap();
     a.config.host = "127.0.0.1".into();
     a.config.port = listener.local_addr().unwrap().port();
     a.config.tls = false;
+
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         socket.write_all(b"* OK ready\r\n").await.unwrap();
+
         let mut io = BufReader::new(socket);
         let mut line = String::new();
         io.read_line(&mut line).await.unwrap();
+
         let tag = line.split_whitespace().next().unwrap();
         io.get_mut()
             .write_all(format!("{tag} NO [AUTHENTICATIONFAILED] rejected\r\n").as_bytes())
             .await
             .unwrap();
     });
+
     let config = Arc::new(support::config(dir.path()));
     let tokens = TokenProvider::new(store.clone(), config.clone()).unwrap();
     tokens
@@ -281,21 +312,26 @@ async fn restart_keeps_password_failure_count_and_elapsed_window() {
         )
         .await
         .unwrap();
+
     let service = Service {
         tokens,
         store: store.clone(),
         files: FileStore::new(dir.path()),
         config,
     };
+
     tokio::time::timeout(
         Duration::from_secs(3),
         service.supervise(a, CancellationToken::new()),
     )
     .await
     .unwrap();
+
     let a = store.account("a").await.unwrap();
+
     assert_eq!(a.status, "needs_reauth");
     assert_eq!(a.consecutive_failures, 4);
+
     server.await.unwrap();
 }
 
@@ -307,11 +343,13 @@ async fn graceful_workers_finish_current_item_and_leave_the_rest_pending() {
         let mut account = support::account(&store, AuthKind::Password).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+
         let (started, entered) = tokio::sync::oneshot::channel();
         let (release, gate) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"* OK ready\r\n").await.unwrap();
+
             let mut io = BufReader::new(socket);
             let mut barrier = Some((started, gate));
 
@@ -354,6 +392,7 @@ async fn graceful_workers_finish_current_item_and_leave_the_rest_pending() {
                 } else {
                     format!("{tag} OK done\r\n")
                 };
+
                 io.get_mut().write_all(response.as_bytes()).await.unwrap();
             }
         });
@@ -366,14 +405,18 @@ async fn graceful_workers_finish_current_item_and_leave_the_rest_pending() {
                     uidvalidity: 1, uid, rfc_message_id: Some(format!("<{uid}@example.test>")),
                     gmail_id: None, thread_id: None, labels: vec![], flags: vec![], size: 1, internal_date: now(),
                 };
+
                 enqueue(c, &pointer, "live", None, false).await?;
             }
+
             sqlx::query("INSERT INTO commands(id,account_id,message_key,kind,read_value,created_at) SELECT id,'a',message_key,'mark_read',1,0 FROM fetch_queue ORDER BY rowid").execute(&mut *c).await?;
             epistle_store::status_tx(c, "a", "active", None, 0).await
         })).await.unwrap();
         account.config.host = address.ip().to_string();
         account.config.port = address.port();
+
         account.config.tls = false;
+
         let config = Arc::new(support::config(dir.path()));
         let tokens = TokenProvider::new(store.clone(), config.clone()).unwrap();
         tokens
@@ -386,12 +429,14 @@ async fn graceful_workers_finish_current_item_and_leave_the_rest_pending() {
             )
             .await
             .unwrap();
+
         let service = Service {
             store: store.clone(),
             tokens,
             files: FileStore::new(dir.path()),
             config,
         };
+
         let stop = CancellationToken::new();
         let cancel = stop.clone();
         let worker = tokio::spawn(async move {
@@ -401,18 +446,22 @@ async fn graceful_workers_finish_current_item_and_leave_the_rest_pending() {
                 service.fetch_worker(&account, &cancel).await
             }
         });
+
         tokio::time::timeout(Duration::from_secs(5), entered)
             .await
             .unwrap()
             .unwrap();
         stop.cancel();
+
         assert!(!worker.is_finished());
+
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), worker)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+
         server.await.unwrap();
 
         let pending: i64 = sqlx::query_scalar(if commands {
@@ -423,7 +472,9 @@ async fn graceful_workers_finish_current_item_and_leave_the_rest_pending() {
         .fetch_one(&store.reads)
         .await
         .unwrap();
+
         assert_eq!(pending, 1);
+
         let completed: i64 = sqlx::query_scalar(if commands {
             "SELECT COUNT(*) FROM commands WHERE state='done'"
         } else {
@@ -432,7 +483,9 @@ async fn graceful_workers_finish_current_item_and_leave_the_rest_pending() {
         .fetch_one(&store.reads)
         .await
         .unwrap();
+
         assert_eq!(completed, 1);
+
         store.close().await.unwrap();
     }
 }

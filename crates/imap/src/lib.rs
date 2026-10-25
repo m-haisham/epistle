@@ -77,6 +77,7 @@ impl From<async_imap::error::Error> for Error {
                     Self::transient("provider_outage")
                 }
             }
+
             async_imap::error::Error::Validate(_) => Self {
                 reason: "invalid_configuration",
                 permanent: true,
@@ -86,9 +87,11 @@ impl From<async_imap::error::Error> for Error {
         }
     }
 }
+
 trait Io: AsyncRead + AsyncWrite + Unpin + Send + Debug {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Debug> Io for T {}
 type Session = async_imap::Session<Box<dyn Io>>;
+
 /// Authenticated IMAP session with bounded operations.
 pub struct Connection {
     session: Session,
@@ -105,10 +108,13 @@ struct Xoauth {
 
 impl async_imap::Authenticator for Xoauth {
     type Response = String;
+
     fn process(&mut self, _: &[u8]) -> String {
+        // RFC 7628 error challenges require an empty acknowledgement.
         if self.sent {
             return String::new();
-        } // RFC 7628 error challenges require an empty acknowledgement.
+        }
+
         self.sent = true;
         format!(
             "user={}\x01auth=Bearer {}\x01\x01",
@@ -148,6 +154,7 @@ impl Connection {
                 let cfg = ClientConfig::builder()
                     .with_root_certificates(roots)
                     .with_no_client_auth();
+
                 let name = ServerName::try_from(a.config.host.clone())
                     .map_err(|_| Error::transient("tls_error"))?;
                 Box::new(
@@ -159,6 +166,7 @@ impl Connection {
             } else {
                 Box::new(tcp)
             };
+
             let mut client = async_imap::Client::new(stream);
             // Every IMAP server sends an initial greeting, including Gmail and
             // Exchange. Client::new does not consume it (Hark did this for Gmail).
@@ -179,6 +187,7 @@ impl Connection {
                 } => {
                     return Err(Error::transient("provider_outage"));
                 }
+
                 imap_proto::Response::Data {
                     status: imap_proto::Status::PreAuth,
                     ..
@@ -191,6 +200,7 @@ impl Connection {
                         auth: false,
                     });
                 }
+
                 _ => return Err(Error::transient("invalid_greeting")),
             }
 
@@ -218,20 +228,24 @@ impl Connection {
                     classified.auth = true;
                     classified.reason = "credentials_rejected";
                 }
+
                 classified
             })?;
+
             let mut connection = Self {
                 session,
                 gmail: false,
                 idle_supported: false,
                 timeout: duration,
             };
+
             let caps = connection.checked("CAPABILITY".into()).await?;
             let has = |name: &str| {
                 caps.capabilities
                     .iter()
                     .any(|c| c.eq_ignore_ascii_case(name))
             };
+
             connection.gmail = has("X-GM-EXT-1");
             connection.idle_supported = has("IDLE");
 
@@ -262,6 +276,7 @@ impl Connection {
             }) {
                 return Ok(vec![all.name.as_ref().into()]);
             }
+
             return Ok(vec!["[Gmail]/All Mail".into()]);
         }
 
@@ -303,6 +318,7 @@ impl Connection {
                 .run_command(command)
                 .await
                 .map_err(Error::from)?;
+
             let mut responses = Checked::default();
 
             loop {
@@ -327,6 +343,7 @@ impl Connection {
                             ))))
                         };
                     }
+
                     Response::Data {
                         status: Status::Bye,
                         ..
@@ -334,12 +351,15 @@ impl Connection {
                     Response::Fetch(_, attrs) => {
                         responses.fetches.push(Fetched::from(attrs.as_slice()))
                     }
+
                     Response::MailboxData(MailboxDatum::Search(ids)) => {
                         responses.ids.extend(ids.iter().copied())
                     }
+
                     Response::MailboxData(MailboxDatum::List(data)) => {
                         responses.mailboxes.push(data.clone().into_owned())
                     }
+
                     Response::Capabilities(caps) => {
                         responses.capabilities.extend(caps.iter().filter_map(|c| {
                             if let imap_proto::Capability::Atom(atom) = c {
@@ -349,6 +369,7 @@ impl Connection {
                             }
                         }))
                     }
+
                     _ => {}
                 }
             }
@@ -381,6 +402,7 @@ impl Connection {
         } else {
             "(UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE)"
         };
+
         let fetched = self.fetch_data(ids, query).await?;
 
         Ok(fetched
@@ -414,16 +436,19 @@ impl Connection {
         } else {
             self.examine(&p.folder).await
         };
+
         let mailbox = match mailbox {
             Ok(mailbox) => mailbox,
             Err(e) if e.reason == "mailbox_missing" => return Ok(None),
             Err(e) => return Err(e),
         };
+
         let validity = i64::from(mailbox.uid_validity.ok_or(Error {
             reason: "uidvalidity_missing",
             permanent: true,
             auth: false,
         })?);
+
         let mut resolved = p.clone();
 
         if validity != p.uidvalidity {
@@ -443,6 +468,7 @@ impl Connection {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
+
                 let candidates = self.fetch_data(&set, "(UID ENVELOPE)").await?;
                 exact = candidates
                     .iter()
@@ -492,6 +518,7 @@ impl Connection {
         } else {
             "-FLAGS.SILENT (\\Seen)"
         };
+
         self.checked(format!("UID STORE {} {cmd}", p.uid)).await?;
 
         Ok(Some(p))
@@ -511,6 +538,7 @@ impl Connection {
             idle_supported,
             timeout: duration,
         } = self;
+
         let mut handle = session.idle();
         bounded(duration, handle.init()).await?;
         {
@@ -589,6 +617,7 @@ impl From<&[AttributeValue<'_>]> for Fetched {
                             .map(|d| d.timestamp())
                             .unwrap_or(0)
                 }
+
                 AttributeValue::Envelope(e) => {
                     result.has_envelope = true;
                     result.message_id = e
@@ -596,14 +625,17 @@ impl From<&[AttributeValue<'_>]> for Fetched {
                         .as_ref()
                         .map(|m| String::from_utf8_lossy(m).into_owned())
                 }
+
                 AttributeValue::GmailMsgId(id) => result.gmail_id = Some(id.to_string()),
                 AttributeValue::GmailThrId(id) => result.thread_id = Some(id.to_string()),
                 AttributeValue::GmailLabels(labels) => {
                     result.labels = labels.iter().map(ToString::to_string).collect()
                 }
+
                 AttributeValue::Flags(flags) => {
                     result.flags = flags.iter().map(ToString::to_string).collect()
                 }
+
                 AttributeValue::BodySection {
                     section: None,
                     data: Some(body),
@@ -613,6 +645,7 @@ impl From<&[AttributeValue<'_>]> for Fetched {
                 _ => {}
             }
         }
+
         result
     }
 }
@@ -625,6 +658,7 @@ fn requested_uid(set: &str, uid: u32) -> bool {
             value.parse::<u32>().ok()
         }
     };
+
     set.split(',').any(|part| {
         if let Some((a, b)) = part.split_once(':') {
             match (bound(a), bound(b)) {
@@ -643,11 +677,13 @@ mod tests {
     #[test]
     fn xoauth_error_challenge_is_acknowledged_without_repeating_secret() {
         use async_imap::Authenticator;
+
         let mut auth = Xoauth {
             email: "a@example.test".into(),
             token: "secret-token".into(),
             sent: false,
         };
+
         assert!(auth.process(b"").contains("auth=Bearer secret-token"));
         assert_eq!(auth.process(br#"{"status":"401"}"#), "");
     }
@@ -657,6 +693,7 @@ mod tests {
         let e = Error::from(async_imap::error::Error::No(
             "[AUTHENTICATIONFAILED] secret-token".into(),
         ));
+
         assert!(e.auth);
         assert!(!e.to_string().contains("secret-token"));
         assert!(quote("bad\r\nUID STORE 1 +FLAGS (\\Seen)").is_err());

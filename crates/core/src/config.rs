@@ -159,6 +159,7 @@ impl Config {
             .build()
             .map_err(config_error)?;
         let file = normalize_legacy_file(file)?;
+
         let legacy = LEGACY_KEYS
             .iter()
             .filter_map(|(old, new)| {
@@ -175,6 +176,7 @@ impl Config {
             .add_source(environment(variables))
             .build()
             .map_err(config_error)?;
+
         let settings: Self = settings.try_deserialize().map_err(config_error)?;
         settings.validate()?;
 
@@ -243,6 +245,7 @@ fn environment_key(path: &str) -> String {
 /// Translates old file keys before merging; an explicit nested value wins.
 fn normalize_legacy_file(file: config::Config) -> Result<config::Config, Error> {
     let mut document: serde_json::Value = file.try_deserialize().map_err(config_error)?;
+
     for (old, path) in LEGACY_KEYS {
         if let Some(value) = document.as_object_mut().and_then(|root| root.remove(*old)) {
             insert_missing(&mut document, path, value)?;
@@ -260,6 +263,7 @@ fn insert_missing(
     let object = root
         .as_object_mut()
         .ok_or_else(|| Error::Config("configuration sections must be tables".into()))?;
+
     if let Some((section, rest)) = path.split_once('.') {
         let child = object
             .entry(section)
@@ -267,6 +271,7 @@ fn insert_missing(
         insert_missing(child, rest, value)
     } else {
         object.entry(path).or_insert(value);
+
         Ok(())
     }
 }

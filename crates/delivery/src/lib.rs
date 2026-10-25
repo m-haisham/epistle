@@ -86,12 +86,14 @@ impl FileStore {
             // Immutable generations prevent redelivery from overwriting retained files.
             let dir = root.join(&message.id).join(id());
             std::fs::create_dir_all(&dir)?;
+
             let mut files = vec![];
 
             for d in drafts {
                 let fid = id();
                 let path = dir.join(&fid);
                 durable_write(&path, &d.bytes)?;
+
                 let manifest = FileManifest {
                     id: fid,
                     role: d.role,
@@ -104,6 +106,7 @@ impl FileStore {
                     content_description: d.content_description,
                     content_location: d.content_location,
                 };
+
                 message.files.push(manifest.clone());
                 files.push(StoredFile {
                     manifest,
@@ -118,9 +121,11 @@ impl FileStore {
                 "idempotency_key":format!("email:{}",hash(event_key.as_bytes())),
                 "message":message,
             });
+
             let payload = serde_json::to_vec(&event)?;
             let payload_path = dir.join("payload.json");
             durable_write(&payload_path, &payload)?;
+
             std::fs::File::open(&dir)?.sync_all()?;
             std::fs::File::open(root.join(&message.id))?.sync_all()?;
             std::fs::File::open(&root)?.sync_all()?;
@@ -138,6 +143,7 @@ impl FileStore {
     /// Expires eligible files and removes startup orphans.
     pub async fn sweep(&self, store: &Store, config: &Config, startup: bool) -> Result<(), Error> {
         tokio::fs::create_dir_all(&self.root).await?;
+
         let pressure = fs2::available_space(&self.root)? < config.storage.disk_reserve_bytes;
 
         let rows = sqlx::query(
@@ -288,6 +294,7 @@ UNION SELECT payload_path FROM messages WHERE expired=0
             .await?;
             let keep: HashSet<_> = rows.into_iter().collect();
             let root = self.root.clone();
+
             tokio::task::spawn_blocking(move || sweep_orphans(&root, &keep)).await??;
         }
 
@@ -297,11 +304,13 @@ UNION SELECT payload_path FROM messages WHERE expired=0
 
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     use std::io::Write;
+
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
     file.write_all(bytes)?;
+
     file.sync_all()
 }
 
@@ -407,6 +416,7 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
         .fetch_all(&self.store.reads)
         .await?;
         let count = rows.len();
+
         let mut tasks = tokio::task::JoinSet::new();
 
         for row in rows {
@@ -418,11 +428,13 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
         // Drain every independent delivery even when one fails to commit. Dropping
         // the JoinSet here would abort unrelated requests after remote acceptance.
         let mut failure = None;
+
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result.map_err(Error::Join).and_then(|r| r) {
                 failure.get_or_insert(error);
             }
         }
+
         if let Some(error) = failure {
             return Err(error);
         }
@@ -434,6 +446,7 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
     async fn deliver(&self, row: sqlx::sqlite::SqliteRow) -> Result<(), Error> {
         let seq: i64 = row.try_get("seq")?;
         tracing::Span::current().record("delivery_id", seq);
+
         let key: String = row.try_get("idempotency_key")?;
         let message_key: String = row.try_get("message_key")?;
         let body = if let Some(p) = row.try_get::<Option<String>, _>("payload")? {
@@ -460,6 +473,7 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
                 }
             }
         };
+
         let timestamp = now();
         let sig = signature(&self.config.delivery.webhook_secret, timestamp, &body)?;
 
@@ -474,6 +488,7 @@ earlier.seq<o.seq AND earlier.state='pending') ORDER BY seq LIMIT 16
             .body(body)
             .send()
             .await;
+
         let status = response.as_ref().ok().map(|r| r.status().as_u16());
 
         if status.is_some_and(|s| (200..300).contains(&s)) {
@@ -498,6 +513,7 @@ message_key=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
                         .bind(&message_key)
                         .execute(&mut *c)
                         .await?;
+
                         sqlx::query(
                             "
 UPDATE messages SET delivered_at=COALESCE(delivered_at,?),expires_at=? WHERE id=? AND
@@ -510,6 +526,7 @@ NOT EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
                         .bind(&message_key)
                         .execute(&mut *c)
                         .await?;
+
                         sqlx::query(
                             "
 UPDATE message_payloads SET expires_at=? WHERE message_key=? AND expired=0 AND NOT
@@ -546,6 +563,7 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<i64>().ok())
                 .map(|s| s.clamp(1, 86400));
+
             let reason = status
                 .map(|s| format!("http_{s}"))
                 .unwrap_or_else(|| "network_error".into());
@@ -574,6 +592,7 @@ EXISTS(SELECT 1 FROM outbox WHERE message_key=?)
             retry_delay_secs = delay,
             "webhook delivery failed"
         );
+
         self.store
             .write(move |c| {
                 Box::pin(async move {
@@ -627,6 +646,7 @@ mod tests {
     #[test]
     fn signatures_bind_exact_bytes_and_timestamp() {
         let signature = signature("secret", 1000, b"{\"a\":1}").unwrap();
+
         assert!(verify_signature(
             "secret",
             1000,
@@ -635,6 +655,7 @@ mod tests {
             1001,
             300
         ));
+
         assert!(!verify_signature(
             "secret",
             1000,
@@ -643,6 +664,7 @@ mod tests {
             1001,
             300
         ));
+
         assert!(!verify_signature(
             "secret",
             1000,
@@ -651,6 +673,7 @@ mod tests {
             1400,
             300
         ));
+
         assert!(!verify_signature(
             "wrong",
             1000,

@@ -89,11 +89,13 @@ impl AccountConfig {
             }
             .into();
         }
+
         if !self.tls && !allow_insecure {
             return Err(Error::Config(
                 "plaintext IMAP requires EPISTLE_TESTING__ALLOW_INSECURE_ENDPOINTS=true".into(),
             ));
         }
+
         if self.port == 0
             || self.host.chars().any(char::is_control)
             || !self
@@ -103,6 +105,7 @@ impl AccountConfig {
         {
             return Err(Error::Config("invalid IMAP host, port or tenant".into()));
         }
+
         if self.folders.len() > 32
             || self
                 .folders

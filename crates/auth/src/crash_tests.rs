@@ -42,6 +42,7 @@ impl Issuer {
         }
 
         self.generation += 1;
+
         let mut body = serde_json::json!({
             "access_token": format!("access-{}", self.generation), "expires_in": 3600,
             "scope": "https://mail.google.com/ https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
@@ -58,6 +59,7 @@ impl Issuer {
                 .unwrap()
                 .insert("refresh_token".into(), serde_json::json!(new));
         }
+
         if let Some(ttl) = self.refresh_lifetime {
             body.as_object_mut()
                 .unwrap()
@@ -91,6 +93,7 @@ impl Server {
             truncate_next: false,
             refresh_lifetime: None,
         }));
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
         let model = state.clone();
@@ -106,9 +109,11 @@ impl Server {
                     if io.read_line(&mut line).await.unwrap() == 0 {
                         break;
                     }
+
                     if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                         length = n.trim().parse::<usize>().unwrap();
                     }
+
                     if line == "\r\n" {
                         break;
                     }
@@ -116,17 +121,20 @@ impl Server {
 
                 let mut body = vec![0; length];
                 io.read_exact(&mut body).await.unwrap();
+
                 let fields: HashMap<_, _> =
                     url::form_urlencoded::parse(&body).into_owned().collect();
                 let (status, response, truncated) = model
                     .lock()
                     .await
                     .issue(fields.get("refresh_token").unwrap().clone());
+
                 let body = serde_json::to_vec(&response).unwrap();
                 let length = body.len() + if truncated { 100 } else { 0 };
                 let header = format!(
                     "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
                 );
+
                 io.get_mut().write_all(header.as_bytes()).await.unwrap();
                 io.get_mut().write_all(&body).await.unwrap();
                 io.get_mut().shutdown().await.unwrap();
@@ -159,6 +167,7 @@ async fn seed(dir: &std::path::Path, server: &Server, kind: AuthKind) -> TokenPr
     )
     .await
     .unwrap();
+
     p
 }
 
@@ -180,7 +189,9 @@ async fn refresh_child() {
     let mut p = provider(&dir, &endpoint).await;
     let a = p.store.account("a").await.unwrap();
     let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+
     p.refresh_save_gate = Some(gate.clone());
+
     let task = tokio::spawn(async move {
         p.get_access_token(&a, false).await.unwrap();
     });
@@ -188,6 +199,7 @@ async fn refresh_child() {
     tokio::fs::write(dir.join("response-received"), b"ready")
         .await
         .unwrap();
+
     task.await.unwrap(); // Never released: parent kills us at the persistence boundary.
 }
 
@@ -206,13 +218,16 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
     } else {
         AuthKind::MicrosoftOauth
     };
+
     let original = seed(dir.path(), &server, kind).await;
     let ciphertext: String =
         sqlx::query_scalar("SELECT ciphertext FROM credentials WHERE account_id='a'")
             .fetch_one(&original.store.reads)
             .await
             .unwrap();
+
     drop(original);
+
     let mut child = Child(
         Command::new(std::env::current_exe().unwrap())
             .args([
@@ -228,6 +243,7 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
             .spawn()
             .unwrap(),
     );
+
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if tokio::fs::try_exists(dir.path().join("response-received"))
@@ -236,6 +252,7 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
             {
                 break;
             }
+
             assert!(
                 child.0.try_wait().unwrap().is_none(),
                 "child exited before response gate"
@@ -245,8 +262,11 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
     })
     .await
     .unwrap();
+
     assert_eq!(server.state.lock().await.generation, 1);
+
     child.0.kill().unwrap();
+
     assert!(!child.0.wait().unwrap().success());
     {
         let mut state = server.state.lock().await;
@@ -255,11 +275,13 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
     }
     // New process state and new SQLx writer epoch, with no retained response in memory.
     let recovered = provider(dir.path(), &server.endpoint).await;
+
     let before: String =
         sqlx::query_scalar("SELECT ciphertext FROM credentials WHERE account_id='a'")
             .fetch_one(&recovered.store.reads)
             .await
             .unwrap();
+
     assert_eq!(
         before, ciphertext,
         "a replacement must not have reached SQLite"
@@ -268,6 +290,7 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
         recovered.load("a").await.unwrap().refresh_token.as_deref(),
         Some("initial-refresh")
     );
+
     let a = recovered.store.account("a").await.unwrap();
 
     let result = recovered.get_access_token(&a, false).await;
@@ -281,6 +304,7 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
         );
     } else {
         assert_eq!(result.unwrap().secret.expose_secret(), "access-2");
+
         let token = recovered
             .load("a")
             .await
@@ -288,6 +312,7 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
             .refresh_token
             .clone()
             .unwrap();
+
         assert_eq!(
             token,
             if matches!(policy, Policy::GoogleReusable) {
@@ -296,7 +321,9 @@ async fn crash_case(policy: Policy, invalidate: Invalidation) {
                 "refresh-2"
             }
         );
+
         recovered.get_access_token(&a, true).await.unwrap();
+
         assert_eq!(
             server.state.lock().await.used,
             ["initial-refresh", "initial-refresh", token.as_str()]
@@ -340,11 +367,13 @@ async fn lost_success_response_is_retryable_with_the_durable_token() {
         let p = seed(dir.path(), &server, kind).await;
         let a = p.store.account("a").await.unwrap();
         server.state.lock().await.truncate_next = true;
+
         assert!(matches!(
             p.get_access_token(&a, false).await,
             Err(Error::Temporary)
         ));
         assert_eq!(server.state.lock().await.generation, 1);
+
         assert_eq!(
             p.load("a").await.unwrap().refresh_token.as_deref(),
             Some("initial-refresh")
@@ -357,6 +386,7 @@ async fn lost_success_response_is_retryable_with_the_durable_token() {
                 .expose_secret(),
             "access-2"
         );
+
         assert_eq!(
             server.state.lock().await.used,
             ["initial-refresh", "initial-refresh"]
@@ -369,20 +399,27 @@ async fn reported_refresh_deadline_survives_rotation_and_restart_and_expires() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::new(Policy::MicrosoftRetainsOld).await;
     server.state.lock().await.refresh_lifetime = Some(120);
+
     let p = seed(dir.path(), &server, AuthKind::MicrosoftOauth).await;
     let a = p.store.account("a").await.unwrap();
     p.get_access_token(&a, false).await.unwrap();
+
     let deadline = p.load("a").await.unwrap().refresh_token_expires_at.unwrap();
+
     assert!((now() + 115..=now() + 120).contains(&deadline));
+
     server.state.lock().await.refresh_lifetime = None;
     p.get_access_token(&a, true).await.unwrap();
+
     assert_eq!(
         p.load("a").await.unwrap().refresh_token_expires_at,
         Some(deadline)
     );
     drop(p);
+
     let p = provider(dir.path(), &server.endpoint).await;
     let mut c = p.load("a").await.unwrap();
+
     assert_eq!(c.refresh_token_expires_at, Some(deadline));
     assert_eq!(
         sqlx::query_scalar::<_, Option<i64>>(
@@ -396,8 +433,10 @@ async fn reported_refresh_deadline_survives_rotation_and_restart_and_expires() {
     // A known deadline is independent of access-token expiry and is never extended
     // by rotation. Simulate passage beyond it, not a provider-specific guessed age.
     c.refresh_token_expires_at = Some(now() - 1);
+
     c.access_expires_at = Some(now() - 1);
     p.save("a", &c).await.unwrap();
+
     assert!(matches!(
         p.get_access_token(&a, false).await,
         Err(Error::Reauth("refresh_token_expired"))
@@ -416,15 +455,19 @@ async fn new_consent_resets_deadline_but_missing_refresh_token_does_not() {
     let p = seed(dir.path(), &server, AuthKind::GoogleOauth).await;
     let a = p.store.account("a").await.unwrap();
     let mut c = p.load("a").await.unwrap();
+
     c.refresh_token_expires_at = Some(1000);
 
     let response = |token: Option<&str>| {
         serde_json::from_value(serde_json::json!({"access_token":"access", "expires_in":3600,"scope":"https://mail.google.com/","refresh_token":token})).unwrap()
     };
     p.apply_response(&a, &mut c, response(None), false).unwrap();
+
     assert_eq!(c.refresh_token_expires_at, Some(1000));
     assert_eq!(c.refresh_token.as_deref(), Some("initial-refresh"));
+
     p.apply_response(&a, &mut c, response(Some("new-grant")), true)
         .unwrap();
+
     assert_eq!(c.refresh_token_expires_at, None);
 }
