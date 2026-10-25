@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 enum Error {
+    #[error(transparent)]
+    Send(#[from] epistle_send::Error),
     #[error("configuration failed: {0}")]
     Config(#[from] epistle_core::Error),
     #[error("filesystem or listener failed")]
@@ -52,6 +54,13 @@ async fn run() -> Result<(), Error> {
     files.sweep(&store, &config, true).await?;
 
     let delivery = Delivery::new(store.clone(), config.clone())?;
+    let sender = epistle_send::Sender {
+        store: store.clone(),
+        tokens: tokens.clone(),
+        config: config.clone(),
+    };
+    sender.recover().await?;
+
     let listener = tokio::net::TcpListener::bind(config.server.bind_addr).await?;
 
     let cancel = CancellationToken::new();
@@ -61,7 +70,7 @@ async fn run() -> Result<(), Error> {
         files,
         config: config.clone(),
     };
-    let mut tasks = spawn_workers(service, delivery, &cancel);
+    let mut tasks = spawn_workers(service, delivery, sender, &cancel);
 
     let router = epistle_api::router(epistle_api::AppState {
         store: store.clone(),
@@ -115,6 +124,7 @@ fn acquire_instance_lock(config: &Config) -> Result<std::fs::File, Error> {
 fn spawn_workers(
     service: epistle_email::Service,
     delivery: Delivery,
+    sender: epistle_send::Sender,
     cancel: &CancellationToken,
 ) -> tokio::task::JoinSet<()> {
     let files = service.files.clone();
@@ -124,6 +134,7 @@ fn spawn_workers(
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(service.run(cancel.clone()));
     tasks.spawn(delivery.run(cancel.clone()));
+    tasks.spawn(sender.run(cancel.clone()));
     tasks.spawn(run_retention(files, store, config, cancel.clone()));
 
     tasks

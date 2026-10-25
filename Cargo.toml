@@ -15,6 +15,7 @@ epistle-core = { path = "crates/core", version = "0.1.0" }
 epistle-delivery = { path = "crates/delivery", version = "0.1.0" }
 epistle-email = { path = "crates/email", version = "0.1.0" }
 epistle-imap = { path = "crates/imap", version = "0.1.0" }
+epistle-send = { path = "crates/send", version = "0.1.0" }
 epistle-store = { path = "crates/store", version = "0.1.0" }
 
 aide = { version = "0.15.1", features = ["axum", "axum-json", "axum-query"] }
@@ -29,6 +30,7 @@ hex = "0.4.3"
 hmac = "0.13.0"
 imap-proto = "0.17.0"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "aws-lc-rs", "webpki-roots"] }
 mail-parser = "1.0.0"
 rand = "0.10.3"
 schemars = { version = "0.9.0", features = ["chrono04"] }

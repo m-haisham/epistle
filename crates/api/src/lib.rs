@@ -34,6 +34,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tracing::Instrument;
 
+mod sending;
+
 /// Shared services used by HTTP handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -175,6 +177,13 @@ pub fn router(state: AppState) -> axum::Router {
         )
         .api_route("/email/accounts/{id}/credentials", post(update_credentials))
         .api_route("/email/accounts/{id}/backfills", post(create_backfill))
+        .api_route("/email/accounts/{id}/smtp", post(sending::configure))
+        .api_route("/email/accounts/{id}/send", post(sending::enqueue))
+        .api_route(
+            "/email/sends/{id}",
+            get(sending::status).delete(sending::cancel),
+        )
+        .api_route("/email/sends/{id}/retry", post(sending::retry))
         .api_route("/email/messages/{id}", get(get_message))
         .api_route("/email/messages/{id}/files/{file_id}", get(download))
         .api_route("/email/messages/{id}/read", post(mark_read))
@@ -244,6 +253,8 @@ fn document_responses(document: &mut Value) {
     // StatusCode is dynamic at runtime; document the concrete success codes used here.
     for (path, method, code) in [
         ("/email/accounts", "post", "201"),
+        ("/email/accounts/{id}/send", "post", "202"),
+        ("/email/sends/{id}/retry", "post", "202"),
         ("/email/accounts/{id}/backfills", "post", "202"),
         ("/email/messages/{id}/read", "post", "202"),
         ("/outbox/{id}/replay", "post", "202"),

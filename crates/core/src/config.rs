@@ -16,6 +16,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub mail: MailConfig,
     pub delivery: DeliveryConfig,
+    pub sending: SendingConfig,
     pub auth: AuthConfig,
     pub testing: TestingConfig,
 }
@@ -117,6 +118,27 @@ impl Default for DeliveryConfig {
     }
 }
 
+/// Outbound SMTP concurrency, retry budget and size limits.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SendingConfig {
+    pub workers: usize,
+    pub timeout_secs: u64,
+    pub max_attempts: i64,
+    pub max_message_bytes: usize,
+}
+
+impl Default for SendingConfig {
+    fn default() -> Self {
+        Self {
+            workers: 4,
+            timeout_secs: 60,
+            max_attempts: 12,
+            max_message_bytes: 1_048_576,
+        }
+    }
+}
+
 /// Credential encryption, provider clients and reauthorization reminders.
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -202,6 +224,11 @@ impl Config {
             || self.storage.index_retention_secs < 1
             || self.mail.reconcile_secs == 0
             || self.mail.watchdog_secs == 0
+            || self.sending.workers == 0
+            || self.sending.workers > 32
+            || self.sending.timeout_secs == 0
+            || self.sending.max_attempts < 1
+            || self.sending.max_message_bytes == 0
             || self.delivery.max_attempts < 1
             || self.mail.fetch.batch_count == 0
             || self.mail.fetch.batch_bytes < 1

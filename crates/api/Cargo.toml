@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 zeroize.workspace = true
 epistle-core.workspace = true
+epistle-send.workspace = true
 epistle-store.workspace = true
 epistle-auth.workspace = true
 epistle-delivery.workspace = true

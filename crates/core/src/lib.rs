@@ -7,7 +7,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub mod config;
+pub mod smtp;
 pub use config::Config;
+pub use smtp::{SmtpConfig, SmtpSecurity};
 
 /// Returns the current Unix timestamp in seconds.
 pub fn now() -> i64 {
@@ -53,7 +55,7 @@ impl AuthKind {
     }
 }
 
-/// IMAP connection and initial synchronization settings.
+/// Account connections and initial synchronization settings.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountConfig {
@@ -63,6 +65,7 @@ pub struct AccountConfig {
     pub folders: Vec<String>,
     pub initial_sync_days: u32,
     pub tenant: String,
+    pub smtp: Option<SmtpConfig>,
 }
 
 impl Default for AccountConfig {
@@ -74,6 +77,7 @@ impl Default for AccountConfig {
             folders: vec![],
             initial_sync_days: 7,
             tenant: "common".into(),
+            smtp: None,
         }
     }
 }
@@ -113,6 +117,10 @@ impl AccountConfig {
                 .any(|f| f.is_empty() || f.chars().any(char::is_control))
         {
             return Err(Error::Config("invalid folders".into()));
+        }
+
+        if let Some(smtp) = &self.smtp {
+            smtp.validate(allow_insecure)?;
         }
 
         Ok(())
