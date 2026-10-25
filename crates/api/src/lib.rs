@@ -118,6 +118,7 @@ impl From<epistle_store::Error> for ApiError {
             {
                 Self::new(StatusCode::CONFLICT, "already_exists")
             }
+
             _ => Self::new(StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
         }
     }
@@ -155,6 +156,7 @@ impl From<std::io::Error> for ApiError {
 /// Builds authenticated operations, OpenAPI and the Scalar reference.
 pub fn router(state: AppState) -> axum::Router {
     aide::generate::infer_responses(true);
+
     let mut api = OpenApi {
         info: Info {
             title: "Epistle Email API".into(),
@@ -164,6 +166,7 @@ pub fn router(state: AppState) -> axum::Router {
         },
         ..Default::default()
     };
+
     let protected = ApiRouter::new()
         .api_route("/email/accounts", post(create_account).get(list_accounts))
         .api_route(
@@ -182,12 +185,31 @@ pub fn router(state: AppState) -> axum::Router {
         .api_route("/outbox/{id}", delete(discard))
         .api_route("/health", get(health))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
+
     let router = protected
         .merge(ApiRouter::new().api_route("/oauth/callback", get(callback)))
         .finish_api(&mut api);
-    // Document security on every operation except the provider callback.
-    let mut document = serde_json::to_value(api).unwrap_or_default();
+    let document = openapi_document(api);
 
+    router
+        .route("/openapi.json", axum::routing::get(openapi))
+        .route("/scalar", axum::routing::get(scalar))
+        .layer(Extension(Arc::new(document)))
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(middleware::from_fn(trace_request))
+        .with_state(state)
+}
+
+fn openapi_document(api: OpenApi) -> Value {
+    let mut document = serde_json::to_value(api).unwrap_or_default();
+    document_security(&mut document);
+    document_responses(&mut document);
+
+    document
+}
+
+/// Documents authentication on every operation except the provider callback.
+fn document_security(document: &mut Value) {
     if let Some(root) = document.as_object_mut() {
         let components = root.entry("components").or_insert_with(|| json!({}));
 
@@ -198,11 +220,13 @@ pub fn router(state: AppState) -> axum::Router {
             );
         }
     }
+
     if let Some(paths) = document.get_mut("paths").and_then(Value::as_object_mut) {
         for (path, item) in paths {
             if path == "/oauth/callback" {
                 continue;
             }
+
             if let Some(ops) = item.as_object_mut() {
                 for (method, op) in ops {
                     if ["get", "post", "delete", "patch"].contains(&method.as_str())
@@ -214,6 +238,9 @@ pub fn router(state: AppState) -> axum::Router {
             }
         }
     }
+}
+
+fn document_responses(document: &mut Value) {
     // StatusCode is dynamic at runtime; document the concrete success codes used here.
     for (path, method, code) in [
         ("/email/accounts", "post", "201"),
@@ -237,6 +264,7 @@ pub fn router(state: AppState) -> axum::Router {
             responses.insert(code.into(), success);
         }
     }
+
     if let Some(operation) = document
         .get_mut("paths")
         .and_then(|p| p.get_mut("/email/messages/{id}/files/{file_id}"))
@@ -246,19 +274,24 @@ pub fn router(state: AppState) -> axum::Router {
         let responses = operation.entry("responses").or_insert_with(|| json!({}));
 
         if let Some(responses) = responses.as_object_mut() {
-            let binary = json!({"description":"File bytes","content":{"application/octet-stream":{"schema":{"type":"string","format":"binary"}}},"headers":{"ETag":{"schema":{"type":"string"}},"Content-Length":{"schema":{"type":"integer"}},"Accept-Ranges":{"schema":{"type":"string"}}}});
+            let binary = json!({
+                "description": "File bytes",
+                "content": {
+                    "application/octet-stream": {
+                        "schema": {"type": "string", "format": "binary"},
+                    },
+                },
+                "headers": {
+                    "ETag": {"schema": {"type": "string"}},
+                    "Content-Length": {"schema": {"type": "integer"}},
+                    "Accept-Ranges": {"schema": {"type": "string"}},
+                },
+            });
             responses.insert("200".into(), binary.clone());
             responses.insert("206".into(), binary);
             responses.insert("304".into(), json!({"description":"Not modified"}));
         }
     }
-    router
-        .route("/openapi.json", axum::routing::get(openapi))
-        .route("/scalar", axum::routing::get(scalar))
-        .layer(Extension(Arc::new(document)))
-        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
-        .layer(middleware::from_fn(trace_request))
-        .with_state(state)
 }
 
 /// Records route templates and timing without URLs, headers or request bodies.
@@ -268,6 +301,7 @@ async fn trace_request(request: Request, next: Next) -> Response {
         .get::<axum::extract::MatchedPath>()
         .map(|path| path.as_str())
         .unwrap_or("unmatched");
+
     let span =
         tracing::info_span!("http_request", request_id = %id(), method = %request.method(), route);
 
@@ -280,6 +314,7 @@ async fn trace_request(request: Request, next: Next) -> Response {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "request completed"
         );
+
         response
     }
     .instrument(span)
@@ -301,12 +336,14 @@ async fn authenticate(State(s): State<AppState>, request: Request, next: Next) -
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
+
     let got = Sha256::digest(key.as_bytes());
     let expected = Sha256::digest(s.config.server.api_key.as_bytes());
 
     if !bool::from(got.as_slice().ct_eq(expected.as_slice())) {
         return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
+
     next.run(request).await
 }
 
@@ -354,12 +391,14 @@ fn validate_credentials(kind: AuthKind, c: &Credentials) -> Result<(), ApiError>
         AuthKind::Password if c.password.as_ref().is_none_or(|p| p.is_empty()) => {
             Err(ApiError::bad("password_required"))
         }
+
         AuthKind::GoogleServiceAccount
             if c.client_email.as_ref().is_none_or(|v| v.is_empty())
                 || c.private_key.as_ref().is_none_or(|v| v.is_empty()) =>
         {
             Err(ApiError::bad("service_account_key_required"))
         }
+
         _ => Ok(()),
     }
 }
@@ -375,17 +414,21 @@ async fn create_account(
     {
         return Err(ApiError::bad("invalid_account"));
     }
+
     body.config
         .normalize(body.auth_kind, s.config.testing.allow_insecure_endpoints)
         .map_err(|e| ApiError::bad(e.to_string()))?;
+
     let credentials = zeroize::Zeroizing::new(Credentials::from(body.credentials));
     validate_credentials(body.auth_kind, &credentials)?;
     s.tokens.ensure_configured(body.auth_kind)?;
+
     let account = id();
     let sealed = s.tokens.encrypt_credentials(&account, &credentials)?;
     let a = account.clone();
     let kind = serde_json::to_string(&body.auth_kind)?;
     let cfg = serde_json::to_string(&body.config)?;
+
     let oauth = body.auth_kind.oauth() && credentials.refresh_token.is_none();
     s.store
         .write(move |c| {
@@ -405,6 +448,7 @@ VALUES(?,?,?,?,?,?,?)
                 .bind(now())
                 .execute(&mut *c)
                 .await?;
+
                 sqlx::query(
                     "INSERT INTO credentials(account_id,ciphertext,updated_at) VALUES(?,?,?)",
                 )
@@ -413,6 +457,7 @@ VALUES(?,?,?,?,?,?,?)
                 .bind(now())
                 .execute(&mut *c)
                 .await?;
+
                 epistle_store::status_tx(
                     c,
                     &a,
@@ -428,6 +473,7 @@ VALUES(?,?,?,?,?,?,?)
             })
         })
         .await?;
+
     let a = s.store.account(&account).await?;
     let redirect_url = if oauth {
         Some(s.tokens.authorization_url(&a).await?)
@@ -464,6 +510,7 @@ async fn update_credentials(
     let credentials = zeroize::Zeroizing::new(Credentials::from(input));
     let oauth = a.auth_kind.oauth() && credentials.refresh_token.is_none();
     validate_credentials(a.auth_kind, &credentials)?;
+
     let _guard = s.tokens.lock(&id).await;
     let sealed = s.tokens.encrypt_credentials(&id, &credentials)?;
     let aid = id.clone();
@@ -479,6 +526,7 @@ WHERE account_id=?
                     .bind(&aid)
                     .execute(&mut *c)
                     .await?;
+
                 sqlx::query("UPDATE accounts SET revision=revision+1,enabled=1 WHERE id=?")
                     .bind(&aid)
                     .execute(&mut *c)
@@ -487,6 +535,7 @@ WHERE account_id=?
                     .bind(&aid)
                     .execute(&mut *c)
                     .await?;
+
                 epistle_store::status_tx(
                     c,
                     &aid,
@@ -502,6 +551,7 @@ WHERE account_id=?
             })
         })
         .await?;
+
     let a = s.store.account(&id).await?;
     let redirect_url = if oauth {
         Some(s.tokens.authorization_url(&a).await?)
@@ -534,6 +584,7 @@ async fn set_enabled(
                     .bind(&aid)
                     .execute(&mut *c)
                     .await?;
+
                 epistle_store::status_tx(
                     c,
                     &aid,
@@ -558,6 +609,7 @@ async fn remove_account(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     s.store.account(&id).await?;
+
     let mids: Vec<String> = sqlx::query_scalar("SELECT id FROM messages WHERE account_id=?")
         .bind(&id)
         .fetch_all(&s.store.reads)
@@ -676,6 +728,7 @@ async fn mark_read(
                         .bind(&mid)
                         .fetch_optional(&mut *c)
                         .await?;
+
                 let account = account.ok_or(epistle_store::Error::NotFound)?;
                 sqlx::query(
                     "
@@ -726,6 +779,7 @@ async fn get_command(
     } else {
         0
     };
+
     let deadline = Instant::now() + Duration::from_secs(wait);
 
     loop {
@@ -734,6 +788,7 @@ async fn get_command(
             .fetch_optional(&s.store.reads)
             .await?
             .ok_or_else(ApiError::not_found)?;
+
         let status = CommandStatus {
             id: id.clone(),
             state: r.try_get("state")?,
@@ -745,6 +800,7 @@ async fn get_command(
         if status.state != "pending" || Instant::now() >= deadline {
             return Ok(Json(status));
         }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -872,6 +928,7 @@ async fn cancel_backfill(
                 if changed == 0 {
                     return Err(epistle_store::Error::NotFound);
                 }
+
                 sqlx::query("DELETE FROM fetch_queue WHERE backfill_id=? AND state='pending'")
                     .bind(id)
                     .execute(c)
@@ -954,6 +1011,7 @@ async fn discard(State(s): State<AppState>, Path(id): Path<i64>) -> Result<Statu
                 .bind(id)
                 .fetch_optional(&mut *c)
                 .await?;
+
                 let key = key.ok_or(epistle_store::Error::Conflict("delivery_not_dead"))?;
                 sqlx::query(
                     "
@@ -966,6 +1024,7 @@ outbox WHERE message_key=?)
                 .bind(&key)
                 .execute(&mut *c)
                 .await?;
+
                 sqlx::query(
                     "
 UPDATE message_payloads SET expires_at=? WHERE message_key=? AND NOT EXISTS(SELECT 1
@@ -977,6 +1036,7 @@ FROM outbox WHERE message_key=?)
                 .bind(&key)
                 .execute(&mut *c)
                 .await?;
+
                 sqlx::query(
                     "
 UPDATE messages SET expires_at=? WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox WHERE
@@ -1043,6 +1103,7 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
         .bind(&a.id)
         .fetch_one(&s.store.reads)
         .await?;
+
         let refresh_expires_at = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT refresh_expires_at FROM credentials WHERE account_id=?",
         )
@@ -1050,6 +1111,7 @@ oldest,SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead FROM outbox
         .fetch_optional(&s.store.reads)
         .await?
         .flatten();
+
         let folder_errors: Vec<(String, String)> = sqlx::query_as("SELECT id,last_error FROM folders WHERE account_id=? AND last_error IS NOT NULL ORDER BY id")
             .bind(&a.id)
             .fetch_all(&s.store.reads)
@@ -1088,17 +1150,20 @@ pub fn byte_range(value: &str, size: u64) -> Result<(u64, u64), ApiError> {
     let (start, end) = range
         .split_once('-')
         .ok_or_else(|| ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid_range"))?;
+
     let invalid = || ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid_range");
 
     if size == 0 || range.contains(',') {
         return Err(invalid());
     }
+
     if start.is_empty() {
         let n = end.parse::<u64>().map_err(|_| invalid())?;
 
         if n == 0 {
             return Err(invalid());
         }
+
         return Ok((size.saturating_sub(n), size - 1));
     }
 
@@ -1155,6 +1220,7 @@ async fn download(
                 .get(header::IF_RANGE)
                 .is_none_or(|v| v.to_str().ok() == Some(&etag))
         });
+
     let mut response = Response::builder();
     let (start, length) = if let Some(range) = requested {
         match byte_range(range, size) {
@@ -1164,6 +1230,7 @@ async fn download(
                     .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
                 (start, end - start + 1)
             }
+
             Err(_) => {
                 return Ok((
                     StatusCode::RANGE_NOT_SATISFIABLE,
@@ -1175,7 +1242,9 @@ async fn download(
     } else {
         (0, size)
     };
+
     file.seek(std::io::SeekFrom::Start(start)).await?;
+
     let filename: String = r.try_get("filename")?;
     let safe: String = filename
         .chars()
@@ -1187,12 +1256,14 @@ async fn download(
             }
         })
         .collect();
+
     let mime: String = r.try_get("content_type")?;
     let mime = if mime.chars().any(char::is_control) {
         "application/octet-stream"
     } else {
         &mime
     };
+
     response
         .header(header::CONTENT_LENGTH, length)
         .header(header::CONTENT_TYPE, mime)
@@ -1230,6 +1301,7 @@ mod tests {
         ] {
             assert!(byte_range(value, 10).is_err());
         }
+
         assert!(byte_range("bytes=0-", 0).is_err());
     }
 }
@@ -1264,6 +1336,7 @@ mod reference_tests {
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             response
@@ -1274,6 +1347,7 @@ mod reference_tests {
                 .unwrap()
                 .starts_with("text/html")
         );
+
         let html = String::from_utf8(
             axum::body::to_bytes(response.into_body(), 16384)
                 .await
@@ -1281,6 +1355,7 @@ mod reference_tests {
                 .to_vec(),
         )
         .unwrap();
+
         assert!(html.contains("url: '/openapi.json'"));
         assert!(html.contains("Scalar.createApiReference"));
         assert!(!html.contains(&config.server.api_key));
@@ -1295,13 +1370,16 @@ mod reference_tests {
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::OK);
+
         let schema: Value = serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), 1_048_576)
                 .await
                 .unwrap(),
         )
         .unwrap();
+
         assert_eq!(
             schema.pointer("/paths/~1health/get/security"),
             Some(&json!([{"apiKey":[]}]))
@@ -1311,11 +1389,13 @@ mod reference_tests {
                 .pointer("/components/schemas/HealthResponse/properties/dead_fetches")
                 .is_some()
         );
+
         assert!(
             schema
                 .pointer("/components/schemas/AccountHealth/properties/folder_errors")
                 .is_some()
         );
+
         assert!(
             schema
                 .pointer("/paths/~1oauth~1callback/get/security")
@@ -1332,6 +1412,7 @@ mod reference_tests {
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
@@ -1347,6 +1428,7 @@ mod reference_tests {
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::OK);
     }
 }
