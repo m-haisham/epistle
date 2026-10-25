@@ -65,7 +65,7 @@ Use the integration commands in README for protocol, authentication, delivery, s
 
 Add regressions for changed failure boundaries, not just happy paths. Relevant scenarios include rejected/partial IMAP responses, disconnects, token response/persistence gaps, database rollback, lost acknowledgments, file retention, cancellation and restart. Use synthetic accounts and local fixtures; never real credentials in tests. Distinguish modeled provider behavior from live acceptance tests.
 
-Keep the cargo-chef GNU/glibc build and nonroot distroless CC runtime working; do not switch back to musl. Preserve the writable data-volume contract and allow enough container stop time for graceful draining. CI additionally runs `cargo audit` and `cargo deny check`.
+Keep the cargo-chef GNU/glibc build and digest-pinned Chainguard `glibc-dynamic` runtime working; do not switch back to musl. Pin the multi-platform index for amd64/arm64 and rerun container checks when updating it. Preserve the nonroot UID, writable data-volume contract and enough container stop time for graceful draining. CI additionally runs `cargo audit` and `cargo deny check`.
 
 ## Change discipline
 

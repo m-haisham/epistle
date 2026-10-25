@@ -123,7 +123,7 @@ Compose allows five minutes to stop. For a manually managed container, use `dock
 
 Run **one instance per data directory** on a persistent local volume. SQLite uses WAL, a read-only query pool and a dedicated fenced writer. Do not share the data directory between replicas or put it on NFS. Back up the database and retained file store consistently, together with a separately stored master key.
 
-The Dockerfile uses cargo-chef and builds a GNU-target binary linked to glibc. Its runtime is Google distroless CC Debian 13, running as `10001:10001`, with no shell or package manager. Persist `/home/epistle/data`; host bind mounts must be writable by that UID. See [container deployment](docs/operations.md#container-deployment) for details.
+The Dockerfile uses cargo-chef and builds a GNU-target binary linked to glibc. Its runtime is Chainguard `glibc-dynamic`, pinned by multi-platform image digest and running as `10001:10001`, with no shell or package manager. Persist `/home/epistle/data`; host bind mounts must be writable by that UID. See [container deployment](docs/operations.md#container-deployment) for details.
 
 Use `RUST_LOG=info,epistle_email=debug,epistle_auth=debug` for diagnostics. Application traces include opaque account/request/delivery IDs, route templates, status and timing; credentials, HTTP bodies and query strings are omitted.
 
