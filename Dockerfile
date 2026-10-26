@@ -1,4 +1,4 @@
-FROM rust:1.99.0-bookworm AS chef
+FROM rust:1.99.1-bookworm AS chef
 ARG CARGO_CHEF_VERSION=0.1.78
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config \
     && rm -rf /var/lib/apt/lists/*
