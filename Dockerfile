@@ -34,7 +34,7 @@ RUN cargo build --locked --release --target "$(cat /rust-target)" -p epistle-ser
     && chmod 0700 /runtime/home/epistle/data
 
 # Pin the multi-platform index so amd64 and arm64 use the same reviewed release.
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:2827063c9efb4ba971d8621eb75f4e61b8d19850a6293a797df37358cc6f687b AS runtime
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5380a8b913d0900cf44180e2205bf3ebf0e0b00a32a0f2fa4ab16cb06d7f9cdf AS runtime
 COPY --from=builder /epistle /usr/local/bin/epistle
 COPY --from=builder --chown=10001:10001 /runtime/home/epistle /home/epistle
 # Preserve ownership compatibility with existing Epistle data volumes.
